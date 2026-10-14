@@ -1019,8 +1019,10 @@ DxgkpTdrWorker(
      * Full batch, page-table, aperture and context-image dumps can take longer
      * than TdrDdiDelay before the miniport even gets to reset the GPU. Their
      * diagnostic records remain available to the debugger. */
+    DxgkpDisarmTdrDdiDeadline(Adapter);
     VidSchDumpEngineDiagnostics(Adapter, FALSE);
     DxgkGpuVaDumpRecentEvents();
+    DxgkpArmTdrDdiDeadline(Adapter);
 
     DxgkPresentBeginReset(Adapter);
     PresentResetStarted = TRUE;
@@ -14879,6 +14881,16 @@ DxgkpAdapterStopInternal(
 
     /* Unregister the display device from win32ss. */
     DxgkDisplayUnregister(Adapter);
+    if (Adapter->DeviceInterfaceEnabled &&
+        NT_SUCCESS(IoSetDeviceInterfaceState(&Adapter->DeviceInterfaceName, FALSE)))
+    {
+        Adapter->DeviceInterfaceEnabled = FALSE;
+    }
+    if (Adapter->DisplayAdapterInterfaceEnabled &&
+        NT_SUCCESS(IoSetDeviceInterfaceState(&Adapter->DisplayAdapterInterfaceName, FALSE)))
+    {
+        Adapter->DisplayAdapterInterfaceEnabled = FALSE;
+    }
 
     /* Tear down the VidPN and its published mode indices. */
     DxgkpDestroyAdapterVidPn(Adapter);

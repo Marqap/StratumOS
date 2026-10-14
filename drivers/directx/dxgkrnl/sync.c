@@ -737,6 +737,7 @@ DxgkSyncNotifyMonitoredFence(
 {
     ULONG Sequence;
     NTSTATUS OverallStatus = STATUS_NOT_FOUND;
+    PDXGKRNL_SYNC_OBJECT Previous = NULL;
 
     if (!DxgkpSyncMonitoredInterruptSupported(Adapter) ||
         NodeOrdinal >= Adapter->NodeCount ||
@@ -745,7 +746,8 @@ DxgkSyncNotifyMonitoredFence(
         return STATUS_INVALID_PARAMETER;
     }
 
-    DxgkpSyncShareInitialize();
+    if (InterlockedCompareExchange(&DxgkSyncShareInitialized, 2, 2) != 2)
+        return STATUS_NOT_FOUND;
     Sequence =
         (ULONG)InterlockedIncrement(
             &DxgkSyncMonitoredInterruptSequence);
@@ -763,7 +765,10 @@ DxgkSyncNotifyMonitoredFence(
         KIRQL OldIrql;
 
         KeAcquireSpinLock(&DxgkSyncMonitoredLock, &OldIrql);
-        for (Entry = DxgkSyncMonitoredListHead.Flink;
+        Entry = Previous != NULL && DxgkpIsListEntryLinked(&Previous->SyncObjListEntry)
+                    ? Previous->SyncObjListEntry.Flink
+                    : DxgkSyncMonitoredListHead.Flink;
+        for (;
              Entry != &DxgkSyncMonitoredListHead;
              Entry = Entry->Flink)
         {
@@ -803,6 +808,9 @@ DxgkSyncNotifyMonitoredFence(
         }
         KeReleaseSpinLock(&DxgkSyncMonitoredLock, OldIrql);
 
+        if (Previous != NULL)
+            ExReleaseRundownProtection(&Previous->MonitoredInterruptRundown);
+        Previous = SyncObj;
         if (SyncObj == NULL)
             break;
         if (SyncObj->MonitoredValueKernelVa != NULL &&
@@ -835,8 +843,6 @@ DxgkSyncNotifyMonitoredFence(
                     OverallStatus = Status;
             }
         }
-        ExReleaseRundownProtection(
-            &SyncObj->MonitoredInterruptRundown);
     }
 
     return OverallStatus;

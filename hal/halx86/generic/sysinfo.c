@@ -105,6 +105,9 @@ HaliQuerySystemInformation(IN HAL_QUERY_INFORMATION_CLASS InformationClass,
                            IN OUT PVOID Buffer,
                            OUT PULONG ReturnedLength)
 {
+    if (ReturnedLength)
+        *ReturnedLength = 0;
+
 #define REPORT_THIS_CASE(X) case X: DPRINT1("Unhandled case: %s\n", #X); break
     switch (InformationClass)
     {
@@ -117,10 +120,7 @@ HaliQuerySystemInformation(IN HAL_QUERY_INFORMATION_CLASS InformationClass,
         REPORT_THIS_CASE(HalMapRegisterInformation);
         REPORT_THIS_CASE(HalMcaLogInformation);
         case HalFrameBufferCachingInformation:
-        {
-            /* FIXME: TODO */
-            return STATUS_NOT_IMPLEMENTED;
-        }
+            return STATUS_INVALID_LEVEL;
         REPORT_THIS_CASE(HalDisplayBiosInformation);
         REPORT_THIS_CASE(HalProcessorFeatureInformation);
         REPORT_THIS_CASE(HalNumaTopologyInterface);
@@ -156,12 +156,25 @@ HaliQuerySystemInformation(IN HAL_QUERY_INFORMATION_CLASS InformationClass,
         }
         REPORT_THIS_CASE(HalHypervisorInformation);
         REPORT_THIS_CASE(HalPlatformTimerInformation);
-        REPORT_THIS_CASE(HalAcpiAuditInformation);
+        case HalAcpiAuditInformation:
+        {
+            PHAL_ACPI_ROOT_POINTER_INFORMATION Information = Buffer;
+            BOOLEAN HasAcpi;
+
+            if (BufferSize < sizeof(*Information))
+                return STATUS_INFO_LENGTH_MISMATCH;
+
+            HasAcpi = HalpQueryAcpiRootPointer(&Information->RsdpPhysicalAddress);
+            *ReturnedLength = sizeof(*Information);
+            return HasAcpi ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+        }
         REPORT_THIS_CASE(HalIrtInformation);
         case HalSecondaryInterruptInformation:
             return HalpSecondaryQueryInformation(BufferSize, Buffer, ReturnedLength);
         REPORT_THIS_CASE(HalParkingPageInformation);
         REPORT_THIS_CASE(HalNumaRangeTableInformation);
+        default:
+            return STATUS_INVALID_LEVEL;
     }
 #undef REPORT_THIS_CASE
 

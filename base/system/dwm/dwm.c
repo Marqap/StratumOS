@@ -1225,6 +1225,31 @@ Upsample:
 }
 
 static BOOL
+DwmCaptureReads(const DWM_WIN *Windows, ULONG First, ULONG Last,
+                LONGLONG Left, LONGLONG Top, LONGLONG Right, LONGLONG Bottom)
+{
+    LONG FilterReach = 2 * (((DwmBlurRadius() + 1) / 2) * DWM_BLUR_PASSES + 2);
+    ULONG Index;
+
+    for (Index = First; Index < Last; ++Index)
+    {
+        const DWM_WIN *Capture = &Windows[Index];
+        LONGLONG X = (LONGLONG)Capture->x - g_originX;
+        LONGLONG Y = (LONGLONG)Capture->y - g_originY;
+
+        if (Capture->BackdropType == DWM_BACKDROP_TRANSIENT &&
+            Capture->BackdropRegion != 0 &&
+            !(Capture->BlurFlags & DWM_BLUR_DISABLE_FILTER) &&
+            Left < X + Capture->cx + FilterReach &&
+            Right > X - FilterReach &&
+            Top < Y + Capture->cy + FilterReach &&
+            Bottom > Y - FilterReach)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL
 DwmWindowIsOpaque(const DWM_WIN *Window)
 {
     if (Window->cx <= 0 || Window->cy <= 0)
@@ -1290,7 +1315,8 @@ DwmWindowIsHidden(const DWM_WIN *Windows, ULONG Count, ULONG Index,
         CoverRight = CoverLeft + Cover->cx;
         CoverBottom = CoverTop + Cover->cy;
         if (CoverLeft <= Left && CoverTop <= Top &&
-            CoverRight >= Right && CoverBottom >= Bottom)
+            CoverRight >= Right && CoverBottom >= Bottom &&
+            !DwmCaptureReads(Windows, Index + 1, Above + 1, Left, Top, Right, Bottom))
             return TRUE;
     }
     return FALSE;
@@ -3017,6 +3043,8 @@ DwmFindOpaqueCover(const DWM_WIN *Windows, ULONG Count, ULONG Index,
         if (Bottom > ClipBottom) Bottom = ClipBottom;
         if (Right <= Left || Bottom <= Top)
             continue;
+        if (DwmCaptureReads(Windows, Index + 1, Above, Left, Top, Right, Bottom))
+            continue;
         Area = (Right - Left) * (Bottom - Top);
         if (Area > BestArea)
         {
@@ -3372,8 +3400,8 @@ DwmBlitWindowAnimated(ULONG *comp, LONG scrW,
 
     if (dxpix != NULL && w->DxWidth != 0 && w->DxHeight != 0)
     {
-        LONG cx = (LONG)((LONGLONG)w->DxWidth * w->AnimCx / w->cx);
-        LONG cy = (LONG)((LONGLONG)w->DxHeight * w->AnimCy / w->cy);
+        LONG cx = (LONG)((LONGLONG)w->DxDrawWidth * w->AnimCx / w->cx);
+        LONG cy = (LONG)((LONGLONG)w->DxDrawHeight * w->AnimCy / w->cy);
 
         clipL = max(clipL, dstX + (LONG)((LONGLONG)w->DxClip.left * w->AnimCx / w->cx));
         clipT = max(clipT, dstY + (LONG)((LONGLONG)w->DxClip.top * w->AnimCy / w->cy));
