@@ -1,11 +1,10 @@
-StratumOS says: To support my dad, check out:
 <p align=center>
   <img alt="LiberNT" src="media/graphics/branding/libernt-logo.png" width="480">
 </p>
 <p align=center>
   <a href="COPYING">
     <img alt="License" src="https://img.shields.io/badge/license-GNU_GPL_3.0-0161B6.svg"></a>
-  <a href="https://github.com/sponsors/ahmedarif193">
+  <a href="https://github.com/ahmedarif193/LiberNT">
     <img alt="Support LiberNT" src="https://img.shields.io/badge/support-LiberNT-E44E4A.svg"></a>
 </p>
 

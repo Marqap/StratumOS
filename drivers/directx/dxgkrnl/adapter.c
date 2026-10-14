@@ -4429,7 +4429,8 @@ DxgkpDrainMonitoredFenceInterruptHandoff(
                 0);
         if (!NT_SUCCESS(Status) &&
             Status != STATUS_NOT_FOUND &&
-            Status != STATUS_DELETE_PENDING)
+            Status != STATUS_DELETE_PENDING &&
+            Status != STATUS_DEVICE_REMOVED)
         {
             DXGKRNL_WARN(
                 "DXGKRNL: monitored-fence interrupt for node %lu "
@@ -7586,6 +7587,16 @@ DxgkCbNotifyInterrupt(
             Adapter,
             NotifyInterruptData->MonitoredFenceSignaled.NodeOrdinal,
             NotifyInterruptData->MonitoredFenceSignaled.EngineOrdinal);
+    }
+    else if (NotifyInterruptData->InterruptType ==
+             DXGK_INTERRUPT_DMA_COMPLETED &&
+             Adapter->NotifyInterruptTypeCount[
+                 DXGK_INTERRUPT_MONITORED_FENCE_SIGNALED] == 0)
+    {
+        (VOID)DxgkpQueueMonitoredFenceEvaluation(
+            Adapter,
+            NotifyInterruptData->DmaCompleted.NodeOrdinal,
+            NotifyInterruptData->DmaCompleted.EngineOrdinal);
     }
 #endif
 #if (DXGKDDI_INTERFACE_VERSION >= DXGKDDI_INTERFACE_VERSION_WDDM2_2)

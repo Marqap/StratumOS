@@ -22,7 +22,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(dxgi);
 
 #ifdef __REACTOS__
-static HRESULT dxgi_factory_create_warp_adapter(REFIID iid, void **adapter);
+static HRESULT dxgi_factory_create_warp_adapter(unsigned int flags, REFIID iid, void **adapter);
 #endif
 
 static inline struct dxgi_factory *impl_from_IWineDXGIFactory(IWineDXGIFactory *iface)
@@ -131,13 +131,22 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_GetParent(IWineDXGIFactory *iface,
     return E_NOINTERFACE;
 }
 
+#if defined(__REACTOS__) && defined(REACTOS_DXGI_D3DKMT_ADAPTER_ORDER)
+static HRESULT dxgi_factory_enum_adapter(IWineDXGIFactory *iface, UINT adapter_idx,
+        DXGI_GPU_PREFERENCE preference, IDXGIAdapter1 **adapter)
+#else
 static HRESULT STDMETHODCALLTYPE dxgi_factory_EnumAdapters1(IWineDXGIFactory *iface,
         UINT adapter_idx, IDXGIAdapter1 **adapter)
+#endif
 {
     struct dxgi_factory *factory = impl_from_IWineDXGIFactory(iface);
     struct dxgi_adapter *adapter_object;
 #if !defined(__REACTOS__) || !defined(REACTOS_DXGI_D3DKMT_ADAPTER_ORDER)
     UINT adapter_count;
+#else
+    DXGI_GPU_PREFERENCE user_preference = dxgi_get_user_gpu_preference();
+    BOOL foreign = FALSE;
+    LUID luid = {0};
 #endif
     HRESULT hr;
 
@@ -147,7 +156,9 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_EnumAdapters1(IWineDXGIFactory *if
         return DXGI_ERROR_INVALID_CALL;
 
 #if defined(__REACTOS__) && defined(REACTOS_DXGI_D3DKMT_ADAPTER_ORDER)
-    if (FAILED(hr = dxgi_get_wddm_adapter_index(factory->wined3d, adapter_idx, &adapter_idx)))
+    if (user_preference != DXGI_GPU_PREFERENCE_UNSPECIFIED)
+        preference = user_preference;
+    if (FAILED(hr = dxgi_get_wddm_adapter(factory->wined3d, adapter_idx, preference, &adapter_idx, &luid, &foreign)))
 #else
     wined3d_mutex_lock();
     adapter_count = wined3d_get_adapter_count(factory->wined3d);
@@ -168,6 +179,10 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_EnumAdapters1(IWineDXGIFactory *if
         *adapter = NULL;
         return hr;
     }
+#if defined(__REACTOS__) && defined(REACTOS_DXGI_D3DKMT_ADAPTER_ORDER)
+    adapter_object->wddm_luid = luid;
+    adapter_object->wddm_foreign = foreign;
+#endif
 
     *adapter = (IDXGIAdapter1 *)&adapter_object->IWineDXGIAdapter_iface;
 
@@ -175,6 +190,14 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_EnumAdapters1(IWineDXGIFactory *if
 
     return S_OK;
 }
+
+#if defined(__REACTOS__) && defined(REACTOS_DXGI_D3DKMT_ADAPTER_ORDER)
+static HRESULT STDMETHODCALLTYPE dxgi_factory_EnumAdapters1(IWineDXGIFactory *iface,
+        UINT adapter_idx, IDXGIAdapter1 **adapter)
+{
+    return dxgi_factory_enum_adapter(iface, adapter_idx, DXGI_GPU_PREFERENCE_UNSPECIFIED, adapter);
+}
+#endif
 
 static HRESULT STDMETHODCALLTYPE dxgi_factory_EnumAdapters(IWineDXGIFactory *iface,
         UINT adapter_idx, IDXGIAdapter **adapter)
@@ -564,7 +587,7 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_EnumWarpAdapter(IWineDXGIFactory *
     if (!adapter)
         return DXGI_ERROR_INVALID_CALL;
 
-    return dxgi_factory_create_warp_adapter(iid, adapter);
+    return dxgi_factory_create_warp_adapter(0, iid, adapter);
 #else
     IDXGIAdapter1 *adapter_object;
     HRESULT hr;
@@ -613,11 +636,16 @@ static HRESULT STDMETHODCALLTYPE dxgi_factory_EnumAdapterByGpuPreference(IWineDX
     TRACE("iface %p, adapter_idx %u, gpu_preference %#x, iid %s, adapter %p.\n",
             iface, adapter_idx, gpu_preference, debugstr_guid(iid), adapter);
 
+#if defined(__REACTOS__) && defined(REACTOS_DXGI_D3DKMT_ADAPTER_ORDER)
+    if (FAILED(hr = dxgi_factory_enum_adapter(iface, adapter_idx, gpu_preference, &adapter_object)))
+        return hr;
+#else
     if (gpu_preference != DXGI_GPU_PREFERENCE_UNSPECIFIED)
         FIXME("Ignoring GPU preference %#x.\n", gpu_preference);
 
     if (FAILED(hr = dxgi_factory_EnumAdapters1(iface, adapter_idx, &adapter_object)))
         return hr;
+#endif
 
     hr = IDXGIAdapter1_QueryInterface(adapter_object, iid, adapter);
     IDXGIAdapter1_Release(adapter_object);
@@ -766,14 +794,14 @@ static HRESULT dxgi_factory_init(struct dxgi_factory *factory, BOOL extended)
 }
 
 #ifdef __REACTOS__
-static HRESULT dxgi_factory_init_software(struct dxgi_factory *factory)
+static HRESULT dxgi_factory_init_software(struct dxgi_factory *factory, unsigned int flags)
 {
     factory->IWineDXGIFactory_iface.lpVtbl = &dxgi_factory_vtbl;
     factory->refcount = 1;
     wined3d_private_store_init(&factory->private_store);
 
     wined3d_mutex_lock();
-    factory->wined3d = wined3d_create(WINED3D_NO3D);
+    factory->wined3d = wined3d_create(WINED3D_NO3D | flags);
     wined3d_mutex_unlock();
     if (!factory->wined3d)
     {
@@ -786,7 +814,7 @@ static HRESULT dxgi_factory_init_software(struct dxgi_factory *factory)
     return S_OK;
 }
 
-static HRESULT dxgi_factory_create_warp_adapter(REFIID iid, void **adapter)
+static HRESULT dxgi_factory_create_warp_adapter(unsigned int flags, REFIID iid, void **adapter)
 {
     struct dxgi_adapter *adapter_object;
     struct dxgi_factory *factory;
@@ -796,7 +824,7 @@ static HRESULT dxgi_factory_create_warp_adapter(REFIID iid, void **adapter)
     if (!(factory = calloc(1, sizeof(*factory))))
         return E_OUTOFMEMORY;
 
-    if (FAILED(hr = dxgi_factory_init_software(factory)))
+    if (FAILED(hr = dxgi_factory_init_software(factory, flags)))
     {
         free(factory);
         return hr;
@@ -813,6 +841,16 @@ static HRESULT dxgi_factory_create_warp_adapter(REFIID iid, void **adapter)
     IWineDXGIAdapter_Release(&adapter_object->IWineDXGIAdapter_iface);
     IWineDXGIFactory_Release(&factory->IWineDXGIFactory_iface);
     return hr;
+}
+
+HRESULT WINAPI RosDxgiCreateNullAdapter(REFIID iid, void **adapter)
+{
+    TRACE("iid %s, adapter %p.\n", debugstr_guid(iid), adapter);
+
+    if (!adapter)
+        return DXGI_ERROR_INVALID_CALL;
+
+    return dxgi_factory_create_warp_adapter(WINED3D_NULL_DRIVER, iid, adapter);
 }
 #endif
 

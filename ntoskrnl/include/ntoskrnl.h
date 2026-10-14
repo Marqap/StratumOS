@@ -4,6 +4,7 @@
  * FILE:            ntoskrnl/include/ntoskrnl.h
  * PURPOSE:         Main Kernel Header
  * PROGRAMMER:      Alex Ionescu (alex@relsoft.net)
+ * CURRENTPROGRAMMER: SpixzyYT (@spixzyyt on YouTube)
  */
 
 #ifndef _NTOSKRNL_PCH
@@ -11,24 +12,38 @@
 
 /* INCLUDES ******************************************************************/
 
-/* ARM Bringup Hack */
+/*
+ * ARM Bring-up Support
+ *
+ * Preserve the existing early-debug-output mapping used during ARM bring-up.
+ */
 #ifdef _M_ARM
 #define DbgPrint DbgPrintEarly
 #endif
 
-/* WDK hacks */
+/*
+ * AMD64 WDK Compatibility
+ *
+ * These aliases preserve the symbol names expected by this codebase.
+ */
 #ifdef _M_AMD64
 #define IoAllocateAdapterChannel _IoAllocateAdapterChannel
 #define KeGetCurrentThread _KeGetCurrentThread
 #define RtlFillMemoryUlong _RtlFillMemoryUlong
 #endif
 
-/* Version Data */
+/* Version Information */
 #undef __MSVCRT__
 #include <psdk/ntverp.h>
 
-/* DDK/IFS/NDK Headers */
+/*
+ * DDK, IFS and NDK Headers
+ *
+ * Keep the original ordering: these declarations precede the
+ * kernel's internal configuration and implementation headers.
+ */
 #define _REALLY_GET_CALLERS_CALLER
+
 #include <excpt.h>
 #include <ntdef.h>
 #include <ntifs.h>
@@ -36,8 +51,16 @@
 #include <diskguid.h>
 #include <arc/arc.h>
 #include <mountmgr.h>
+
+/*
+ * HAL API Imports
+ *
+ * Preserve the existing import configuration for NTHALAPI.
+ */
 #undef NTHALAPI
 #define NTHALAPI __declspec(dllimport)
+
+/* Native Development Kit Headers */
 #include <ndk/asm.h>
 #include <ndk/cctypes.h>
 #include <ndk/cmfuncs.h>
@@ -59,6 +82,11 @@
 #include <ndk/sefuncs.h>
 #include <ndk/vftypes.h>
 
+/*
+ * String Compatibility
+ *
+ * The kernel expects TEXT() to generate wide-string literals.
+ */
 #undef TEXT
 #define TEXT(s) L##s
 
@@ -67,63 +95,104 @@
 
 #include <ntstrsafe.h>
 #include <ntpoapi.h>
+
+/*
+ * Integer Safety Functions
+ *
+ * Enable signed integer-safe functions only for this include.
+ */
 #define ENABLE_INTSAFE_SIGNED_FUNCTIONS
 #include <ntintsafe.h>
 #undef ENABLE_INTSAFE_SIGNED_FUNCTIONS
 
-/* C Headers */
+/* Standard C Headers */
 #include <stdlib.h>
 #include <stdio.h>
 #include <ctype.h>
 #include <malloc.h>
 #include <wchar.h>
 
-/* SEH support with PSEH */
+/* Structured Exception Handling */
 #include <pseh/pseh2.h>
 
-/* SetupLDR Support */
+/* Setup Loader Support */
 #include <arc/setupblk.h>
 
-/* KD Support */
+/*
+ * Kernel Debugger Support
+ *
+ * Preserve the original debugger declarations and conditional
+ * KDBG symbol remapping.
+ */
 #define NOEXTAPI
 #include <windbgkd.h>
 #include <wdbgexts.h>
 #include <kddll.h>
+
 #ifdef KDBG
-    /* Define new names for these exports also present in KDBG */
-    #define KdD0Transition          KdbgD0Transition
-    #define KdD3Transition          KdbgD3Transition
-    #define KdSave                  KdbgSave
-    #define KdRestore               KdbgRestore
-    #define KdSendPacket            KdbgSendPacket
-    #define KdReceivePacket         KdbgReceivePacket
-    /* And reload the definitions with these new names */
+
+    /*
+     * Redirect debugger exports to their KDBG implementations.
+     */
+    #define KdD0Transition  KdbgD0Transition
+    #define KdD3Transition  KdbgD3Transition
+    #define KdSave          KdbgSave
+    #define KdRestore       KdbgRestore
+    #define KdSendPacket    KdbgSendPacket
+    #define KdReceivePacket KdbgReceivePacket
+
+    /*
+     * Reload the definitions using the KDBG symbol mappings.
+     * Retain the original ReactOS header-reload mechanism.
+     */
     #undef _KDDLL_
     #include <kddll.h>
-#endif
 
-/* PNP GUIDs */
+#endif /* KDBG */
+
+/* Plug and Play System GUIDs */
 #include <umpnpmgr/sysguid.h>
 
-/* SRM header */
+/* Security Reference Monitor */
 #include <srmp.h>
 
+/*
+ * Status Exception Compatibility
+ *
+ * Preserve the existing alias used throughout the kernel.
+ */
 #define ExRaiseStatus RtlRaiseStatus
 
-/* Also defined in fltkernel.h, but we don't want the entire header */
+/*
+ * Pointer Helpers
+ *
+ * These helpers are also defined by fltkernel.h. Avoid redefining
+ * them if a preceding header has already provided the macros.
+ */
 #ifndef Add2Ptr
 #define Add2Ptr(P,I) ((PVOID)((PUCHAR)(P) + (I)))
 #endif
+
 #ifndef PtrOffset
 #define PtrOffset(B,O) ((ULONG)((ULONG_PTR)(O) - (ULONG_PTR)(B)))
 #endif
 
-/* MAX_PATH is a Win32 concept, it doesn't belong in the kernel */
+/*
+ * MAX_PATH Compatibility Check
+ *
+ * Preserve the original check and subsequent undefinition.
+ * Do not introduce a fallback that masks a missing definition.
+ */
 #define MAX_WIN32_PATH 260
 C_ASSERT(MAX_WIN32_PATH == MAX_PATH);
 #undef MAX_PATH
 
-/* Internal Headers */
+/*
+ * Internal Kernel Headers
+ *
+ * Keep config.h immediately before internal/ntoskrnl.h, as in
+ * the original StratumOS branch.
+ */
 #include "config.h"
 #include "internal/ntoskrnl.h"
 
@@ -131,11 +200,12 @@ C_ASSERT(MAX_WIN32_PATH == MAX_PATH);
 #include "internal/probe.h"
 #include "resource.h"
 
-/* Internal Ps alignment probing header */
+/* Internal Process Structure Alignment Probing */
 #include "internal/ps_i.h"
 
+/* MSVC-Specific Section Attributes */
 #ifdef _MSC_VER
-# pragma section("INITDATA", read,write,discard)
+#pragma section("INITDATA", read, write, discard)
 #endif
 
 #endif /* _NTOSKRNL_PCH */
