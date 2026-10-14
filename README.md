@@ -1,7 +1,7 @@
+StratumOS says: To support my dad, check out:
 <p align=center>
   <img alt="LiberNT" src="media/graphics/branding/libernt-logo.png" width="480">
 </p>
-
 <p align=center>
   <a href="COPYING">
     <img alt="License" src="https://img.shields.io/badge/license-GNU_GPL_3.0-0161B6.svg"></a>
@@ -16,21 +16,22 @@
 [Wiki](https://github.com/ahmedarif193/LiberNT/wiki) &bull;
 [Build environment](https://github.com/ahmedarif193/winget-rosbe)
 
-## What is LiberNT?
+## What is StratumOS?
 
-LiberNT is a free NT operating system, built out of love for the NT architecture. The name says it: *liber* is Latin for free. LiberNT targets Windows® 11 compatibility, with room for freestyle and experimental features.
+StratumOS is a free NT-derived OS with the mission of Windows® 11 compatibility, with room for good looks and upstreaming.
 
-LiberNT is based on ReactOS, the Open Source effort to develop an operating system that is compatible with applications and drivers written for the Microsoft Windows NT family of operating systems. It is a fork with extensive changes to kernel-space components and drivers, aimed at stability and modern hardware, and it focuses on 64-bit platforms: amd64, arm64 and riscv64.
+StratumOS is based on LiberNT which is based on ReactOS, the Open Source effort to develop an operating system that is compatible with applications and drivers written for the Microsoft Windows NT family of operating systems. It is a fork with extensive changes to kernel-space components and drivers, aimed at stability and modern hardware, and it focuses on 64-bit platforms: amd64, arm64 and riscv64.
 
-Our goal is a system that stays maintainable in the long run: stable, reliable and efficient, running on embedded devices too, and able to support every feature a modern operating system should have.
+Our goal is the same as LibreNT's goal, make an OS that's dependable, and you can trust with your data (unlike Microsoft's)
 
 LiberNT is licensed under the [GNU GPL 3.0](COPYING). Code inherited from ReactOS keeps the licence stated in its file headers, most of it GPL 2.0 or later. The GPL 2.0, LGPL 2.1 and BSD texts those files refer to are in [COPYING2](COPYING2), [COPYING.LIB](COPYING.LIB) and [COPYING.ARM](COPYING.ARM).
 
-The changes made in LiberNT are Copyright © 2026 the LiberNT contributors. Code inherited from ReactOS and from third parties keeps the copyright notices of its authors. See [CREDITS.md](CREDITS.md).
+The changes made in LiberNT are Copyright © 2026 the LiberNT contributors. Code inherited from ReactOS and from third parties keeps the copyright notices of its authors. See [CREDITS.md](CREDITS.md). (NOTE: STRATUMOS IS NOT AFILLIATED WITH LIBERNT)
 
 ### Status
 
 So far, LiberNT has proven more stable and faster than ReactOS in CPU management, memory management and I/O resource handling. Windows 11 is the compatibility reference.
+We still haven't reached Windows 11 compatibility levels as of right now, but we're getting closer and closer every day.
 
 ## Support LiberNT
 
@@ -38,7 +39,7 @@ We want LiberNT to be a free NT operating system that everyone can rely on, ever
 
 ## Upstream ReactOS
 
-LiberNT would not exist without ReactOS. With all our respect and gratitude to the ReactOS Team & Contributors, whose work LiberNT builds on, you can find the upstream source code at [github.com/reactos/reactos](https://github.com/reactos/reactos).
+StratumOS wouldn't exist without LiberNT which **itself** wouldn't exist without without ReactOS. With all our respect and gratitude to the ReactOS Team & Contributors, whose work LiberNT builds on, you can find the upstream source code at [github.com/reactos/reactos](https://github.com/reactos/reactos).
 
 ## Building
 
@@ -139,9 +140,9 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) and [PULL_REQUEST_MANAGEMENT.md](PULL_REQ
 
 ## Use of AI
 
-We want to make it clear: AI is part of how LiberNT is built. It helps us review and write code, and everything it writes is then reviewed by a human. Before anything reaches the main branch, a person runs and validates the end-to-end tests. We care about this project too much to let a regression slip through.
+We want to make it clear: AI is part of how LiberNT and StratumOS are built. It helps us review and write code, which is rectified by another AI model then rectified by a human.
 
-It also helps us read documentation, extract definitions and fix bugs. For any given bug, it compares what the official Microsoft Learn documentation says with what our function actually does, so we can see exactly where our behavior differs.
+"It also helps us read documentation, extract definitions and fix bugs. For any given bug, it compares what the official Microsoft Learn documentation says with what our function actually does, so we can see exactly where our behavior differs.
 
 Like any other tool, AI is there to help us achieve our goals. It follows the same rules we hold ourselves to, set out in [AGENTS.md](AGENTS.md):
 
@@ -150,4 +151,5 @@ Like any other tool, AI is there to help us achieve our goals. It follows the sa
 - A fix is only a fix once we have seen it work in a real boot or test run. Once tests pass, a future CI will keep them passing and preserve our overall progress.
 - We compare our test results check by check with the same tests run on Windows 11.
 
-If you use AI in your own contributions, you are welcome here too. Just tell us in the pull request which parts it helped with and how you tested them. That honesty is all we ask.
+If you use AI in your own contributions, you are welcome here too. Just tell us in the pull request which parts it helped with and how you tested them. That honesty is all we ask."
+- The amazing people behind LiberNT
