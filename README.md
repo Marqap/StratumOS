@@ -60,8 +60,8 @@ On Windows, we suggest WSL2. Install it with `wsl --install`, open the Linux ter
 ### 2. Get the source
 
 ```sh
-git clone https://github.com/ahmedarif193/LiberNT.git
-cd LiberNT
+git clone https://github.com/Marqap/StratumOS.git
+cd StratumOS
 ```
 
 The first configure run also fetches the submodule and external sources the build needs.
