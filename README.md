@@ -1,4 +1,3 @@
-StratumOS says: To support my dad, check out:
 <p align=center>
   <img alt="LiberNT" src="media/graphics/branding/libernt-logo.png" width="480">
 </p>
