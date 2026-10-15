@@ -34,7 +34,7 @@ We still haven't reached Windows 11 compatibility levels as of right now, but we
 
 ## Support LiberNT
 
-We want LiberNT to be a free NT operating system that everyone can rely on, every day. Support our goal by [donating](https://github.com/sponsors/ahmedarif193) or by joining our new community. See [Contributing](#contributing) to get started.
+We want StratumOS to be a free NT operating system that everyone can rely on, every day. Support the open source collective's cause by [donating to LibreNT](https://github.com/sponsors/ahmedarif193) or by joining their new community. See [Contributing](#contributing) to get started.
 
 ## Upstream ReactOS
 
@@ -137,7 +137,7 @@ Report bugs and suggest features in [Issues](https://github.com/ahmedarif193/Lib
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [PULL_REQUEST_MANAGEMENT.md](PULL_REQUEST_MANAGEMENT.md).
 
-**Legal notice:** If you have seen proprietary Microsoft Windows source code (including but not limited to the leaked Windows NT 3.5, NT 4, 2000 source code and the Windows Research Kernel), your contribution won't be accepted because of potential copyright violation.
+**Legal notice:** If you have seen proprietary Microsoft Windows source code (including but not limited to the leaked Windows NT 3.5, NT 4, 2000 source code and the Windows Research Kernel), your contribution won't be accepted because of potential copyright violations.
 
 ## Use of AI
 
