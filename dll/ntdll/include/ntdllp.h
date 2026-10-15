@@ -627,4 +627,35 @@ BOOLEAN
 RtlpArchQueryPerformanceFrequency(
     _Out_ PLARGE_INTEGER Frequency);
 
+NTSTATUS
+LdrpFindModuleResourceEntry(
+    PVOID BaseAddress,
+    LDR_RESOURCE_INFO *Info,
+    ULONG Level,
+    PVOID *Entry,
+    BOOLEAN WantDirectory);
+
+NTSTATUS
+NTAPI
+LdrpGetAlternateResourceModule(
+    _In_ PVOID BaseAddress,
+    _In_ ULONG_PTR Type,
+    _In_ USHORT LanguageId,
+    _Out_ PVOID *ResourceBase);
+
+PVOID
+NTAPI
+LdrpGetResourceModuleForEntry(
+    _In_ PVOID BaseAddress,
+    _In_ PVOID Entry);
+
+BOOLEAN
+NTAPI
+LdrpUnloadAlternateResourceModule(
+    _In_ PVOID BaseAddress);
+
+BOOLEAN
+NTAPI
+LdrpFlushAlternateResourceModules(VOID);
+
 /* EOF */

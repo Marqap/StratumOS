@@ -13,6 +13,7 @@
 #define BM_NAME_CHARS      64
 #define BM_STORE_NAME      L"BCD"
 #define BM_DEFAULT_TITLE   L"Boot Manager"
+#define BM_BOOT_TIMEOUT    3
 
 static const PCWSTR BmStorePaths[] =
 {
@@ -75,7 +76,8 @@ BmStartEntry(
         return;
 
     FbGuiVtbl.UnInitialize();
-    GuiShowFirmwareLogo();
+    if (!UiKeepFirmwareScreen)
+        GuiShowFirmwareLogo();
     BmStartApplication(&BmEntries[Index], BmStorePath, &Startup);
     GuiInitialize();
 }
@@ -249,6 +251,14 @@ BmRunTextMenu(
     for (i = 0; i < BmCount; i++)
         BmTextNames[i] = BmEntries[i].Description;
 
+    if (Timeout >= 0 && !BmUiWaitForKey(Timeout))
+    {
+        RtlZeroMemory(&Startup, sizeof(Startup));
+        BmStartApplication(&BmEntries[BmSelected], BmStorePath, &Startup);
+    }
+
+    Timeout = -1;
+
     for (;;)
     {
         if (!BmUiInitialize())
@@ -289,6 +299,7 @@ BmRunMenu(
 {
     if (GuiInitialize())
     {
+        UiKeepFirmwareScreen = (Timeout > 0);
         BmRunGuiMenu(Timeout);
         FbGuiVtbl.UnInitialize();
         return;
@@ -300,11 +311,8 @@ BmRunMenu(
 VOID
 BlMain(VOID)
 {
-    BM_STARTUP Startup;
-    ULONGLONG Seconds;
     PVOID Store;
     ULONG Size, Default;
-    LONG Timeout;
 
     Store = BmReadStore(BmStorePath, RTL_NUMBER_OF(BmStorePath), &Size);
     if (!Store || !BcdOpenStore(Store, Size))
@@ -324,15 +332,5 @@ BlMain(VOID)
         RtlStringCchCopyW(BmTitle, RTL_NUMBER_OF(BmTitle), BM_DEFAULT_TITLE);
 
     BmSelected = Default;
-    Timeout = BmGetTimeout(&Seconds) ? (LONG)min(Seconds, (ULONGLONG)MAXLONG) : -1;
-
-    if (BmCount > 1 || BmGetDisplayBootMenu())
-    {
-        BmRunMenu(Timeout);
-        return;
-    }
-
-    RtlZeroMemory(&Startup, sizeof(Startup));
-    if (!BmStartApplication(&BmEntries[Default], BmStorePath, &Startup))
-        BmRunMenu(-1);
+    BmRunMenu(BM_BOOT_TIMEOUT);
 }

@@ -55,6 +55,7 @@ struct vt_state
     int                 mouse_y;
     BOOL                focus_events;
     BOOL                bracketed_paste;
+    WCHAR               high_surrogate;
     BOOL                has_margins;
     unsigned int        margin_top;
     unsigned int        margin_bottom;
@@ -89,7 +90,7 @@ static struct vt_state *vt_get_state( struct screen_buffer *screen_buffer )
     vt->pen.fg = -1;
     vt->pen.bg = -1;
     vt->pen.fg_rgb = vt->pen.bg_rgb = CLR_INVALID;
-    vt->cell.fg = vt->cell.bg = CLR_INVALID;
+    vt->cell.fg = vt->cell.bg = vt->cell.underline = CLR_INVALID;
     screen_buffer->vt = vt;
     return vt;
 }
@@ -128,7 +129,7 @@ static void vt_color_cells( struct screen_buffer *screen_buffer, unsigned int fi
     struct vt_state *vt = screen_buffer->vt;
     unsigned int size = screen_buffer->width * screen_buffer->height, i;
 
-    if (vt->cell.fg == CLR_INVALID && vt->cell.bg == CLR_INVALID)
+    if (vt->cell.fg == CLR_INVALID && vt->cell.bg == CLR_INVALID && vt->cell.underline == CLR_INVALID)
     {
         reset_cell_colors( screen_buffer, first, count );
         return;
@@ -243,10 +244,12 @@ static void vt_reverse_index( struct screen_buffer *screen_buffer, struct vt_sta
         screen_buffer->cursor_y--;
 }
 
-static void vt_put( struct screen_buffer *screen_buffer, struct vt_state *vt, WCHAR ch, RECT *rect )
+static void vt_put_cells( struct screen_buffer *screen_buffer, struct vt_state *vt, WCHAR lead, WCHAR trail,
+                          unsigned int width, RECT *rect )
 {
-    char_info_t *cell;
+    unsigned int index;
 
+    if (width == 2 && screen_buffer->width < 2) width = 1;
     if (screen_buffer->cursor_x >= screen_buffer->width)
     {
         if (screen_buffer->mode & ENABLE_WRAP_AT_EOL_OUTPUT)
@@ -256,14 +259,50 @@ static void vt_put( struct screen_buffer *screen_buffer, struct vt_state *vt, WC
         }
         else screen_buffer->cursor_x = screen_buffer->width - 1;
     }
+    if (width == 2 && screen_buffer->cursor_x == screen_buffer->width - 1)
+    {
+        if (screen_buffer->mode & ENABLE_WRAP_AT_EOL_OUTPUT)
+        {
+            index = screen_buffer->cursor_y * screen_buffer->width + screen_buffer->cursor_x;
+            put_char_cells( screen_buffer, index, ' ', ' ', screen_buffer->attr, 1 );
+            vt_color_cells( screen_buffer, index, 1 );
+            vt_touch( rect, screen_buffer->cursor_x - 1, screen_buffer->cursor_y,
+                      screen_buffer->cursor_x, screen_buffer->cursor_y );
+            screen_buffer->cursor_x = 0;
+            vt_index( screen_buffer, vt, rect );
+        }
+        else screen_buffer->cursor_x--;
+    }
+    index = screen_buffer->cursor_y * screen_buffer->width + screen_buffer->cursor_x;
+    put_char_cells( screen_buffer, index, lead, trail, screen_buffer->attr, width );
+    vt_color_cells( screen_buffer, index, width );
+    vt_touch( rect, screen_buffer->cursor_x ? screen_buffer->cursor_x - 1 : 0, screen_buffer->cursor_y,
+              min( screen_buffer->cursor_x + width, screen_buffer->width - 1 ), screen_buffer->cursor_y );
+    screen_buffer->cursor_x += width;
+}
+
+static void vt_put( struct screen_buffer *screen_buffer, struct vt_state *vt, WCHAR ch, RECT *rect )
+{
+    WCHAR high = vt->high_surrogate;
+
+    vt->high_surrogate = 0;
+    if (IS_HIGH_SURROGATE( ch ))
+    {
+        if (high) vt_put_cells( screen_buffer, vt, 0xfffd, 0xfffd, 1, rect );
+        vt->high_surrogate = ch;
+        return;
+    }
+    if (IS_LOW_SURROGATE( ch ))
+    {
+        if (high && console_char_width( 0x10000 + ((high - 0xd800) << 10) + (ch - 0xdc00) ) == 2)
+            vt_put_cells( screen_buffer, vt, high, ch, 2, rect );
+        else
+            vt_put_cells( screen_buffer, vt, 0xfffd, 0xfffd, 1, rect );
+        return;
+    }
+    if (high) vt_put_cells( screen_buffer, vt, 0xfffd, 0xfffd, 1, rect );
     if (vt->pen.line_drawing && ch >= 0x60 && ch <= 0x7e) ch = line_drawing_map[ch - 0x60];
-    cell = &screen_buffer->data[screen_buffer->cursor_y * screen_buffer->width + screen_buffer->cursor_x];
-    cell->ch = ch;
-    cell->attr = screen_buffer->attr;
-    vt_color_cells( screen_buffer, cell - screen_buffer->data, 1 );
-    vt_touch( rect, screen_buffer->cursor_x, screen_buffer->cursor_y,
-              screen_buffer->cursor_x, screen_buffer->cursor_y );
-    screen_buffer->cursor_x++;
+    vt_put_cells( screen_buffer, vt, ch, ch, console_char_width( ch ), rect );
 }
 
 static unsigned int vt_nearest_color( struct screen_buffer *screen_buffer, unsigned int r,
@@ -332,7 +371,8 @@ static void vt_apply_pen( struct screen_buffer *screen_buffer, struct vt_state *
         vt->cell.fg = vt->pen.bg_rgb;
         vt->cell.bg = vt->pen.fg_rgb;
     }
-    screen_buffer->attr = fg | (bg << 4) | (vt->pen.underline ? COMMON_LVB_UNDERSCORE : 0);
+    vt->cell.underline = vt->pen.underline ? 0 : CLR_INVALID;
+    screen_buffer->attr = fg | (bg << 4);
 }
 
 static unsigned int vt_extended_color( struct screen_buffer *screen_buffer, struct vt_state *vt,
@@ -400,7 +440,7 @@ static void vt_sgr( struct screen_buffer *screen_buffer, struct vt_state *vt )
 
 static void vt_input( struct console *console, const WCHAR *text, unsigned int count )
 {
-    INPUT_RECORD records[32];
+    INPUT_RECORD records[64];
     unsigned int i;
 
     count = min( count, ARRAY_SIZE(records) );
@@ -419,7 +459,7 @@ static void vt_input( struct console *console, const WCHAR *text, unsigned int c
 
 static void vt_reply( struct console *console, const char *text )
 {
-    WCHAR buffer[32];
+    WCHAR buffer[64];
     unsigned int count;
 
     for (count = 0; text[count] && count < ARRAY_SIZE(buffer); count++)
@@ -621,14 +661,20 @@ static void vt_private_mode( struct screen_buffer *screen_buffer, struct vt_stat
             vt->bracketed_paste = enable;
             break;
         case 47:
-        case 1047:
             vt_alternate_buffer( screen_buffer, vt, enable, rect );
             break;
         case 1049:
             if (enable == (vt->main_data != NULL)) break;
             if (enable) vt_save_cursor( screen_buffer, vt );
             vt_alternate_buffer( screen_buffer, vt, enable, rect );
-            if (!enable) vt_restore_cursor( screen_buffer, vt );
+            if (enable)
+            {
+                screen_buffer->cursor_x = min( vt->main_cursor_x - min( vt->main_cursor_x, (unsigned int)vt->main_win.left ),
+                                               screen_buffer->width - 1 );
+                screen_buffer->cursor_y = min( vt->main_cursor_y - min( vt->main_cursor_y, (unsigned int)vt->main_win.top ),
+                                               screen_buffer->height - 1 );
+            }
+            else vt_restore_cursor( screen_buffer, vt );
             break;
         }
     }
@@ -670,7 +716,7 @@ static void vt_csi( struct screen_buffer *screen_buffer, struct vt_state *vt, WC
     {
         if (vt->intermediate == '!' && final == 'p') vt_soft_reset( screen_buffer, vt );
         else if (vt->intermediate == ' ' && final == 'q')
-            screen_buffer->cursor_size = vt_param( vt, 0, 1 ) <= 2 ? 100 : 25;
+            screen_buffer->vt_cursor_size = !vt_param( vt, 0, 0 ) ? 0 : vt_param( vt, 0, 0 ) <= 2 ? 100 : 25;
         return;
     }
 
@@ -768,7 +814,7 @@ static void vt_csi( struct screen_buffer *screen_buffer, struct vt_state *vt, WC
         }
         break;
     case 'c':
-        if (!vt_param( vt, 0, 0 )) vt_reply( screen_buffer->console, "\x1b[?1;0c" );
+        if (!vt_param( vt, 0, 0 )) vt_reply( screen_buffer->console, "\x1b[?61;1;6;7;21;22;23;24;28;32;42c" );
         break;
     }
 }

@@ -293,6 +293,45 @@ SetXmmRegFromStackValue(
  *  - Test and compare with Windows behaviour
  */
 static
+BOOLEAN
+RtlpIsInEpilogV2(
+    _In_ PUNWIND_INFO UnwindInfo,
+    _In_ PRUNTIME_FUNCTION FunctionEntry,
+    _In_ ULONG64 ControlRva)
+{
+    ULONG EpilogSize, EpilogOffset;
+    ULONG Index;
+
+    if (UnwindInfo->UnwindCode[0].UnwindOp != UWOP_EPILOG)
+        return FALSE;
+
+    EpilogSize = UnwindInfo->UnwindCode[0].CodeOffset;
+    if (UnwindInfo->UnwindCode[0].OpInfo & 1)
+    {
+        EpilogOffset = FunctionEntry->EndAddress - EpilogSize;
+        if (ControlRva - EpilogOffset < EpilogSize)
+            return TRUE;
+    }
+
+    for (Index = 1; Index < UnwindInfo->CountOfCodes; Index++)
+    {
+        if (UnwindInfo->UnwindCode[Index].UnwindOp != UWOP_EPILOG)
+            break;
+
+        EpilogOffset = UnwindInfo->UnwindCode[Index].CodeOffset +
+                       UnwindInfo->UnwindCode[Index].OpInfo * 256;
+        if (EpilogOffset == 0)
+            break;
+
+        EpilogOffset = FunctionEntry->EndAddress - EpilogOffset;
+        if (ControlRva - EpilogOffset < EpilogSize)
+            return TRUE;
+    }
+
+    return FALSE;
+}
+
+static
 __inline
 BOOLEAN
 RtlpTryToUnwindEpilog(
@@ -306,7 +345,7 @@ RtlpTryToUnwindEpilog(
     BYTE *InstrPtr;
     DWORD Instr;
     BYTE Reg, Mod;
-    ULONG64 EndAddress;
+    ULONG64 BeginAddress, EndAddress;
 
     /* Make a local copy of the context */
     LocalContext = *Context;
@@ -363,7 +402,8 @@ RtlpTryToUnwindEpilog(
     }
 
     /* Loop the following instructions before the ret */
-    EndAddress = FunctionEntry->EndAddress + ImageBase - 1;
+    BeginAddress = FunctionEntry->BeginAddress + ImageBase;
+    EndAddress = FunctionEntry->EndAddress + ImageBase;
     while ((DWORD64)InstrPtr < EndAddress)
     {
         Instr = *(DWORD*)InstrPtr;
@@ -388,26 +428,37 @@ RtlpTryToUnwindEpilog(
             continue;
         }
 
-        /* Opcode not allowed for Epilog */
-        return FALSE;
+        break;
     }
 
-    // check for popfq
-
-    // also allow end with jmp imm, jmp [target], iretq
-
-    /* Check if we are at the ret instruction */
-    if ((DWORD64)InstrPtr != EndAddress)
-    {
-        /* If we went past the end of the function, something is broken! */
-        ASSERT((DWORD64)InstrPtr <= EndAddress);
+    if ((DWORD64)InstrPtr >= EndAddress)
         return FALSE;
-    }
 
-    /* Make sure this is really a ret instruction */
-    if (*InstrPtr != 0xc3)
+    if (InstrPtr[0] == 0xf3 && (DWORD64)InstrPtr + 1 < EndAddress)
+        InstrPtr++;
+
+    if (InstrPtr[0] != 0xc3)
     {
-        return FALSE;
+        ULONG64 Target;
+
+        if (InstrPtr[0] == 0xe9 && (DWORD64)InstrPtr + 5 <= EndAddress)
+        {
+            Target = (ULONG64)InstrPtr + 5 + *(LONG*)(InstrPtr + 1);
+        }
+        else if (InstrPtr[0] == 0xeb && (DWORD64)InstrPtr + 2 <= EndAddress)
+        {
+            Target = (ULONG64)InstrPtr + 2 + (CHAR)InstrPtr[1];
+        }
+        else
+        {
+            if ((InstrPtr[0] & 0xf0) == 0x40)
+                InstrPtr++;
+            if (InstrPtr[0] != 0xff || (InstrPtr[1] & 0xf8) != 0x20)
+                return FALSE;
+            Target = 0;
+        }
+        if (Target != 0 && Target >= BeginAddress && Target < EndAddress)
+            return FALSE;
     }
 
     /* Unwind is finished, pop new Rip from Stack */
@@ -514,7 +565,8 @@ RtlVirtualUnwind(
     }
 
     /* Check if we are in the function epilog and try to finish it */
-    if ((CodeOffset > UnwindInfo->SizeOfProlog) && (UnwindInfo->CountOfCodes > 0))
+    if ((CodeOffset > UnwindInfo->SizeOfProlog) && (UnwindInfo->CountOfCodes > 0) &&
+        ((UnwindInfo->Version < 2) || RtlpIsInEpilogV2(UnwindInfo, FunctionEntry, ControlRva)))
     {
         if (RtlpTryToUnwindEpilog(Context, ControlPc, ContextPointers, ImageBase, FunctionEntry))
         {

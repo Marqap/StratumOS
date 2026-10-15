@@ -279,7 +279,11 @@ static void load_config( const WCHAR *key_name, struct console_config *config )
 #endif
     config->sb_height    = 150;
     config->sb_width     = 80;
+#ifdef __REACTOS__
+    config->attr         = FOREGROUND_BLUE | FOREGROUND_GREEN | FOREGROUND_RED;
+#else
     config->attr         = 0x000F;
+#endif
     config->win_height   = 25;
     config->win_width    = 80;
     config->win_pos.X    = 0;
@@ -476,13 +480,23 @@ static void fill_mem_dc( struct console *console, const RECT *update )
 #ifdef __REACTOS__
     const struct cell_color *colors;
     COLORREF fg, bg;
+    unsigned int first, last;
 #endif
 
     if (!console->window->font || !console->window->bitmap)
         return;
 
+#ifdef __REACTOS__
+    if (!(line = malloc( (update->right - update->left + 3) * sizeof(WCHAR))) ) return;
+    if (!(dx = malloc( (update->right - update->left + 3) * sizeof(*dx) )))
+    {
+        free( line );
+        return;
+    }
+#else
     if (!(line = malloc( (update->right - update->left + 1) * sizeof(WCHAR))) ) return;
     dx = malloc( (update->right - update->left + 1) * sizeof(*dx) );
+#endif
 
     old_font = SelectObject( console->window->mem_dc, console->window->font );
     for (j = update->top; j <= update->bottom; j++)
@@ -490,36 +504,42 @@ static void fill_mem_dc( struct console *console, const RECT *update )
         cell = &console->active->data[j * console->active->width];
 #ifdef __REACTOS__
         colors = console->active->colors ? &console->active->colors[j * console->active->width] : NULL;
-#endif
-        for (i = update->left; i <= update->right; i++)
+        first = update->left;
+        last = update->right;
+        if (first && (cell[first].attr & COMMON_LVB_TRAILING_BYTE)) first--;
+        if (last + 1 < console->active->width && (cell[last].attr & COMMON_LVB_LEADING_BYTE)) last++;
+        for (i = first; i <= last; i++)
         {
-            attr = cell[i].attr;
-#ifdef __REACTOS__
+            unsigned int count = 0;
+
+            attr = cell[i].attr & ~CELL_WIDE_FLAGS;
             fg = console->active->color_map[attr & 0x0F];
             bg = console->active->color_map[(attr >> 4) & 0x0F];
             if (colors && colors[i].fg != CLR_INVALID) fg = colors[i].fg;
             if (colors && colors[i].bg != CLR_INVALID) bg = colors[i].bg;
             SetBkColor( console->window->mem_dc, bg );
             SetTextColor( console->window->mem_dc, fg );
-            for (k = i; k <= update->right && cell[k].attr == attr &&
-                        (!colors || (colors[k].fg == colors[i].fg && colors[k].bg == colors[i].bg)); k++)
-#else
-            SetBkColor( console->window->mem_dc, console->active->color_map[(attr >> 4) & 0x0F] );
-            SetTextColor( console->window->mem_dc, console->active->color_map[attr & 0x0F] );
-            for (k = i; k <= update->right && cell[k].attr == attr; k++)
-#endif
+            for (k = i; k <= last && (cell[k].attr & ~CELL_WIDE_FLAGS) == attr &&
+                        (!colors || (colors[k].fg == colors[i].fg && colors[k].bg == colors[i].bg &&
+                                     colors[k].underline == colors[i].underline)); k++)
             {
-                line[k - i] = cell[k].ch;
-                dx[k - i] = console->active->font.width;
+                if ((cell[k].attr & COMMON_LVB_TRAILING_BYTE) && k > i &&
+                    (cell[k - 1].attr & COMMON_LVB_LEADING_BYTE))
+                {
+                    dx[count - 1] += console->active->font.width;
+                    if (IS_LOW_SURROGATE( cell[k].ch ) && IS_HIGH_SURROGATE( line[count - 1] ))
+                    {
+                        line[count] = cell[k].ch;
+                        dx[count++] = 0;
+                    }
+                    continue;
+                }
+                line[count] = (cell[k].attr & COMMON_LVB_TRAILING_BYTE) ? ' ' : cell[k].ch;
+                dx[count++] = console->active->font.width;
             }
             ExtTextOutW( console->window->mem_dc, i * console->active->font.width,
-                         j * console->active->font.height, 0, NULL, line, k - i, dx );
-            if (console->window->ext_leading &&
-#ifdef __REACTOS__
-                (brush = CreateSolidBrush( bg )))
-#else
-                (brush = CreateSolidBrush( console->active->color_map[(attr >> 4) & 0x0F] )))
-#endif
+                         j * console->active->font.height, 0, NULL, line, count, dx );
+            if (console->window->ext_leading && (brush = CreateSolidBrush( bg )))
             {
                 r.left   = i * console->active->font.width;
                 r.top    = (j + 1) * console->active->font.height - console->window->ext_leading;
@@ -528,8 +548,8 @@ static void fill_mem_dc( struct console *console, const RECT *update )
                 FillRect( console->window->mem_dc, &r, brush );
                 DeleteObject( brush );
             }
-#ifdef __REACTOS__
-            if ((attr & COMMON_LVB_UNDERSCORE) && (brush = CreateSolidBrush( fg )))
+            if (((attr & COMMON_LVB_UNDERSCORE) || (colors && colors[i].underline != CLR_INVALID)) &&
+                (brush = CreateSolidBrush( fg )))
             {
                 r.left   = i * console->active->font.width;
                 r.top    = (j + 1) * console->active->font.height - console->window->ext_leading - 1;
@@ -538,9 +558,34 @@ static void fill_mem_dc( struct console *console, const RECT *update )
                 FillRect( console->window->mem_dc, &r, brush );
                 DeleteObject( brush );
             }
-#endif
             i = k - 1;
         }
+#else
+        for (i = update->left; i <= update->right; i++)
+        {
+            attr = cell[i].attr;
+            SetBkColor( console->window->mem_dc, console->active->color_map[(attr >> 4) & 0x0F] );
+            SetTextColor( console->window->mem_dc, console->active->color_map[attr & 0x0F] );
+            for (k = i; k <= update->right && cell[k].attr == attr; k++)
+            {
+                line[k - i] = cell[k].ch;
+                dx[k - i] = console->active->font.width;
+            }
+            ExtTextOutW( console->window->mem_dc, i * console->active->font.width,
+                         j * console->active->font.height, 0, NULL, line, k - i, dx );
+            if (console->window->ext_leading &&
+                (brush = CreateSolidBrush( console->active->color_map[(attr >> 4) & 0x0F] )))
+            {
+                r.left   = i * console->active->font.width;
+                r.top    = (j + 1) * console->active->font.height - console->window->ext_leading;
+                r.right  = k * console->active->font.width;
+                r.bottom = (j + 1) * console->active->font.height;
+                FillRect( console->window->mem_dc, &r, brush );
+                DeleteObject( brush );
+            }
+            i = k - 1;
+        }
+#endif
     }
     SelectObject( console->window->mem_dc, old_font );
     free( dx );
@@ -560,7 +605,11 @@ static void update_window_cursor( struct console *console )
 /* sets a new shape for the cursor */
 static void shape_cursor( struct console *console )
 {
+#ifdef __REACTOS__
+    int size = console->active->vt_cursor_size ? console->active->vt_cursor_size : console->active->cursor_size;
+#else
     int size = console->active->cursor_size;
+#endif
 
 #ifdef __REACTOS__
     if (console->window->cursor_visible && console->win == GetFocus()) DestroyCaret();
@@ -745,11 +794,21 @@ static void update_window( struct console *console )
         UpdateWindow( console->win );
     }
 
+#ifdef __REACTOS__
+    if (update_all || (console->active->vt_cursor_size ? console->active->vt_cursor_size : console->active->cursor_size) !=
+                      console->window->cursor_size)
+    {
+        console->window->cursor_size = console->active->vt_cursor_size ? console->active->vt_cursor_size
+                                                                         : console->active->cursor_size;
+        shape_cursor( console );
+    }
+#else
     if (update_all || console->active->cursor_size != console->window->cursor_size)
     {
         console->window->cursor_size = console->active->cursor_size;
         shape_cursor( console );
     }
+#endif
 
     if (console->active->cursor_visible != console->window->cursor_visible)
     {

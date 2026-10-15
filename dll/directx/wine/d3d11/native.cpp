@@ -5684,24 +5684,32 @@ void STDMETHODCALLTYPE NativeContext::ClearState()
     bool previous = recording_disabled;
     recording_disabled = true;
     SetPredication(NULL, FALSE);
-    VSSetShader(NULL, NULL, 0);
-    PSSetShader(NULL, NULL, 0);
-    GSSetShader(NULL, NULL, 0);
-    HSSetShader(NULL, NULL, 0);
-    DSSetShader(NULL, NULL, 0);
-    CSSetShader(NULL, NULL, 0);
+    if (vertex_shader) VSSetShader(NULL, NULL, 0);
+    if (pixel_shader) PSSetShader(NULL, NULL, 0);
+    if (geometry_shader) GSSetShader(NULL, NULL, 0);
+    if (hull_shader) HSSetShader(NULL, NULL, 0);
+    if (domain_shader) DSSetShader(NULL, NULL, 0);
+    if (compute_shader) CSSetShader(NULL, NULL, 0);
     ID3D11ShaderResourceView *views[128] = {};
     ID3D11SamplerState *states[16] = {};
     ID3D11Buffer *buffers[14] = {};
     for (UINT i = 0; i < 6; ++i)
     {
-        SetShaderResources(i, 0, 128, views);
-        SetSamplers(i, 0, 16, states);
-        SetConstantBuffers(i, 0, 14, buffers);
+        UINT bound = ARRAYSIZE(shader_resources[i]);
+        while (bound && !shader_resources[i][bound - 1]) --bound;
+        if (bound) SetShaderResources(i, 0, bound, views);
+        bound = ARRAYSIZE(samplers[i]);
+        while (bound && !samplers[i][bound - 1]) --bound;
+        if (bound) SetSamplers(i, 0, bound, states);
+        bound = ARRAYSIZE(constant_buffers[i]);
+        while (bound && !constant_buffers[i][bound - 1]) --bound;
+        if (bound) SetConstantBuffers(i, 0, bound, buffers);
     }
     ID3D11UnorderedAccessView *uavs[8] = {};
-    CSSetUnorderedAccessViews(0, device->feature_level >= D3D_FEATURE_LEVEL_11_0 ? 8 : 1, uavs, NULL);
-    SOSetTargets(0, NULL, NULL);
+    UINT bound_uavs = device->feature_level >= D3D_FEATURE_LEVEL_11_0 ? 8 : 1;
+    while (bound_uavs && !compute_uavs[bound_uavs - 1]) --bound_uavs;
+    if (bound_uavs) CSSetUnorderedAccessViews(0, bound_uavs, uavs, NULL);
+    if (stream_outputs[0] || stream_outputs[1] || stream_outputs[2] || stream_outputs[3]) SOSetTargets(0, NULL, NULL);
     OMSetRenderTargetsAndUnorderedAccessViews(0, NULL, NULL, 0, 0, NULL, NULL);
     OMSetBlendState(NULL, NULL, ~0u);
     OMSetDepthStencilState(NULL, 0);
@@ -7493,11 +7501,13 @@ void NativeSwapChain::DumpTrace()
 HRESULT NativeSwapChain::PresentMeasured(UINT interval, UINT flags, const DXGI_PRESENT_PARAMETERS *parameters)
 {
     if (interval > 4 || (flags & ~(DXGI_PRESENT_TEST | DXGI_PRESENT_DO_NOT_WAIT | DXGI_PRESENT_RESTART
-            | DXGI_PRESENT_DO_NOT_SEQUENCE))) return DXGI_ERROR_INVALID_CALL;
+            | DXGI_PRESENT_DO_NOT_SEQUENCE | DXGI_PRESENT_ALLOW_TEARING))) return DXGI_ERROR_INVALID_CALL;
     if (parameters && ((parameters->DirtyRectsCount && !parameters->pDirtyRects)
             || (!!parameters->pScrollRect != !!parameters->pScrollOffset))) return DXGI_ERROR_INVALID_CALL;
     if (parameters && parameters->pScrollRect) return E_NOTIMPL;
     NativeLock guard(device);
+    if ((flags & DXGI_PRESENT_ALLOW_TEARING) && (interval || !(desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING)
+            || !fullscreen_desc.Windowed)) return DXGI_ERROR_INVALID_CALL;
     HRESULT device_status = device->GetDeviceRemovedReason();
     if (FAILED(device_status)) return device_status;
     if (!(composition && !window) && !IsWindow(window)) return DXGI_ERROR_INVALID_CALL;

@@ -117,6 +117,7 @@ struct cell_color
 {
     COLORREF fg;
     COLORREF bg;
+    COLORREF underline;
 };
 #endif
 
@@ -143,6 +144,7 @@ struct screen_buffer
 #ifdef __REACTOS__
     struct vt_state       *vt;
     struct cell_color     *colors;
+    unsigned int           vt_cursor_size;
 #endif
 };
 
@@ -158,6 +160,16 @@ void set_vt_console_title( struct console *console, const WCHAR *title, size_t s
 void resize_cell_colors( struct screen_buffer *screen_buffer, unsigned int new_width, unsigned int new_height );
 void vt_write( struct screen_buffer *screen_buffer, const WCHAR *buffer, size_t len, RECT *update_rect );
 void vt_destroy( struct screen_buffer *screen_buffer );
+
+#define CELL_WIDE_FLAGS (COMMON_LVB_LEADING_BYTE | COMMON_LVB_TRAILING_BYTE)
+
+unsigned int console_char_width( unsigned int ch );
+#define PUT_CELLS_LEFT  1
+#define PUT_CELLS_RIGHT 2
+
+int break_wide_cell( struct screen_buffer *screen_buffer, unsigned int index );
+unsigned int put_char_cells( struct screen_buffer *screen_buffer, unsigned int index, WCHAR lead, WCHAR trail,
+                             unsigned short attr, unsigned int width );
 BOOL vt_translate_key( struct console *console, const INPUT_RECORD *record );
 BOOL vt_translate_mouse( struct console *console, UINT msg, WPARAM wparam, LPARAM lparam );
 void vt_focus_event( struct console *console, BOOL focused );

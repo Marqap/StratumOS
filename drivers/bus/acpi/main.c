@@ -48,13 +48,20 @@ AcpiGetSystemTableIoctl(
         AcpiPutTable(Table);
         return STATUS_ACPI_INVALID_DATA;
     }
-    Irp->IoStatus.Information = TableLength;
     if (OutputLength < TableLength)
     {
+        if (OutputLength < sizeof(*Table))
+        {
+            AcpiPutTable(Table);
+            return STATUS_BUFFER_TOO_SMALL;
+        }
+        RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, Table, sizeof(*Table));
+        Irp->IoStatus.Information = sizeof(*Table);
         AcpiPutTable(Table);
-        return STATUS_BUFFER_TOO_SMALL;
+        return STATUS_BUFFER_OVERFLOW;
     }
     RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, Table, TableLength);
+    Irp->IoStatus.Information = TableLength;
     AcpiPutTable(Table);
     return STATUS_SUCCESS;
 }
@@ -116,10 +123,13 @@ AcpiEnumSystemTablesIoctl(
         Count++;
     }
 
-    Irp->IoStatus.Information = Count * sizeof(*Entries);
     if (Count > Capacity)
-        return STATUS_BUFFER_TOO_SMALL;
+    {
+        Irp->IoStatus.Information = Capacity * sizeof(*Entries);
+        return STATUS_BUFFER_OVERFLOW;
+    }
 
+    Irp->IoStatus.Information = Count * sizeof(*Entries);
     return STATUS_SUCCESS;
 }
 
@@ -513,11 +523,9 @@ ACPIDispatchDeviceControl(
     PCOMMON_DEVICE_DATA     commonData;
     ULONG Caps = 0;
     HANDLE ThreadHandle;
-    BOOLEAN IsThermalQuery;
 
     irpStack = IoGetCurrentIrpStackLocation (Irp);
     ASSERT (IRP_MJ_DEVICE_CONTROL == irpStack->MajorFunction);
-    IsThermalQuery = irpStack->Parameters.DeviceIoControl.IoControlCode == IOCTL_THERMAL_QUERY_INFORMATION;
 
     commonData = (PCOMMON_DEVICE_DATA) DeviceObject->DeviceExtension;
 
@@ -571,10 +579,6 @@ ACPIDispatchDeviceControl(
         {
             Irp->IoStatus.Status = status;
             IoCompleteRequest(Irp, IO_NO_INCREMENT);
-        }
-        else
-        {
-            IoMarkIrpPending(Irp);
         }
 
         return status;
@@ -715,11 +719,6 @@ ACPIDispatchDeviceControl(
     {
         Irp->IoStatus.Status = status;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
-    }
-    else
-    {
-        if (!IsThermalQuery)
-            IoMarkIrpPending(Irp);
     }
 
     return status;

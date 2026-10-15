@@ -18,6 +18,7 @@
 /* GLOBALS *******************************************************************/
 
 ULONG PopShutdownPowerOffPolicy;
+BOOLEAN PopShutdownLog;
 KEVENT PopShutdownEvent;
 PPOP_SHUTDOWN_WAIT_ENTRY PopShutdownThreadList;
 LIST_ENTRY PopShutdownQueue;
@@ -150,6 +151,9 @@ PopDisplayShutdownScreen(VOID)
     KeRaiseIrqlToDpcLevel();
     _disable();
 
+    if (PopShutdownLog)
+        return;
+
     /* Do we have boot video */
     if (InbvIsBootDriverInstalled())
     {
@@ -199,7 +203,8 @@ PopShutdownSystem(IN POWER_ACTION SystemAction)
             //PopInvokeSystemStateHandler(PowerStateShutdownReset, NULL);
             PopSetSystemPowerState(PowerSystemShutdown, SystemAction);
             DPRINT1("REBOOT: device power transition complete\n");
-            PopDisplayShutdownScreen();
+            KeRaiseIrqlToDpcLevel();
+            _disable();
             DPRINT1("REBOOT: entering HAL reset\n");
             HalReturnToFirmware(HalRebootRoutine);
 
@@ -222,11 +227,12 @@ PopShutdownSystem(IN POWER_ACTION SystemAction)
             //PopInvokeSystemStateHandler(PowerStateShutdownOff, NULL);
 
             PopSetSystemPowerState(PowerSystemShutdown, SystemAction);
-            PopDisplayShutdownScreen();
+            KeRaiseIrqlToDpcLevel();
+            _disable();
             HalReturnToFirmware(HalPowerDownRoutine);
 
             /* The firmware refused to power us off */
-            for (;;) HalHaltSystem();
+            PopShutdownHandler();
             break;
 
         default:
