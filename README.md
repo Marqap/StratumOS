@@ -42,11 +42,11 @@ StratumOS wouldn't exist without LiberNT which **itself** wouldn't exist without
 
 ## Building
 
-LiberNT builds with RosBE, a cross-build toolchain. The steps below work on Linux and macOS, and on Windows through WSL2.
+StratumOS is built with RosBE, a cross-build toolchain. The steps below work on Linux and macOS, and on Windows through WSL2.
 
 ### 1. Install the tools
 
-You need Git, CMake, Ninja and a C/C++ compiler for your own machine. RosBE adds the compilers that build LiberNT.
+You need Git, CMake, Ninja and a C/C++ compiler for your own machine. RosBE adds the compilers that build StratumOS.
 
 StratumOS does not have its own fork of the ahmedarif193 tools, And even if it did, We still recommend obtaining them from the original source since it may be more up to date sometimes.
 
