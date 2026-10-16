@@ -11,12 +11,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3d12);
 
-HRESULT STDMETHODCALLTYPE Native12Device::CreatePipelineLibrary(const void *, SIZE_T, REFIID, void **out)
-{
-    if (out) *out = NULL;
-    return DXGI_ERROR_UNSUPPORTED;
-}
-
 HRESULT STDMETHODCALLTYPE Native12Device::SetEventOnMultipleFenceCompletion(ID3D12Fence *const *fences,
         const UINT64 *values, UINT count, D3D12_MULTIPLE_FENCE_WAIT_FLAGS flags, HANDLE event)
 {
@@ -49,12 +43,30 @@ static SIZE_T Native12AlignStream(SIZE_T value, SIZE_T alignment)
     return (value + alignment - 1) & ~(alignment - 1);
 }
 
-HRESULT STDMETHODCALLTYPE Native12Device::CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
-        REFIID iid, void **out)
+static bool Native12ViewInstancingValid(const D3D12_VIEW_INSTANCING_DESC &desc, UINT highest_shader_model,
+        D3D12DDI_VIEW_INSTANCING_TIER tier)
+{
+    bool supported = tier != D3D12DDI_VIEW_INSTANCING_TIER_NOT_SUPPORTED;
+    if (!desc.ViewInstanceCount && !desc.pViewInstanceLocations && !desc.Flags) return true;
+    if (desc.ViewInstanceCount == 1 && highest_shader_model < D3D_SHADER_MODEL_6_1) return false;
+    if (desc.Flags & ~D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING) return false;
+    if ((desc.Flags & D3D12_VIEW_INSTANCING_FLAG_ENABLE_VIEW_INSTANCE_MASKING) && !supported) return false;
+    return desc.ViewInstanceCount <= 1 || (supported && desc.ViewInstanceCount <= D3D12_MAX_VIEW_INSTANCE_COUNT);
+}
+
+HRESULT Native12Device::InitializePipelineState(Native12PipelineState *pipeline,
+        const D3D12_PIPELINE_STATE_STREAM_DESC *desc)
 {
     D3D12_GRAPHICS_PIPELINE_STATE_DESC graphics = {};
     D3D12_SHADER_BYTECODE compute_shader = {}, amplification = {}, mesh = {};
     D3D12_DEPTH_STENCIL_DESC1 depth = {};
+    D3D12_DEPTH_STENCIL_DESC2 depth2 = {};
+    D3D12_RASTERIZER_DESC1 raster1 = {};
+    D3D12_RASTERIZER_DESC2 raster2 = {};
+    bool face_masks = false, float_bias = false, line_set = false;
+    UINT8 back_read = 0, back_write = 0;
+    FLOAT bias = 0.0f;
+    D3D12_LINE_RASTERIZATION_MODE line = D3D12_LINE_RASTERIZATION_MODE_ALIASED;
     D3D12_RT_FORMAT_ARRAY targets = {};
     D3D12_VIEW_INSTANCING_DESC view_instancing = {};
     D3D12_PIPELINE_STATE_FLAGS flags = D3D12_PIPELINE_STATE_FLAG_NONE;
@@ -62,8 +74,7 @@ HRESULT STDMETHODCALLTYPE Native12Device::CreatePipelineState(const D3D12_PIPELI
     UINT node_mask = 0;
     UINT64 seen = 0;
 
-    if (!desc || !out || (desc->SizeInBytes && !desc->pPipelineStateSubobjectStream)) return E_INVALIDARG;
-    *out = NULL;
+    if (!desc || (desc->SizeInBytes && !desc->pPipelineStateSubobjectStream)) return E_INVALIDARG;
 
     graphics.SampleMask = D3D12_DEFAULT_SAMPLE_MASK;
     graphics.SampleDesc.Count = 1;
@@ -129,33 +140,122 @@ HRESULT STDMETHODCALLTYPE Native12Device::CreatePipelineState(const D3D12_PIPELI
             NATIVE12_SUBOBJECT(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_VIEW_INSTANCING, view_instancing, D3D12_VIEW_INSTANCING_DESC)
             NATIVE12_SUBOBJECT(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, amplification, D3D12_SHADER_BYTECODE)
             NATIVE12_SUBOBJECT(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, mesh, D3D12_SHADER_BYTECODE)
+            NATIVE12_SUBOBJECT(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2, depth2, D3D12_DEPTH_STENCIL_DESC2)
+            NATIVE12_SUBOBJECT(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1, raster1, D3D12_RASTERIZER_DESC1)
+            NATIVE12_SUBOBJECT(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2, raster2, D3D12_RASTERIZER_DESC2)
             default:
                 WARN("Unsupported pipeline state subobject type %#x.\n", type);
                 return E_INVALIDARG;
         }
 #undef NATIVE12_SUBOBJECT
-        if (seen & (1ull << type)) return E_INVALIDARG;
+        D3D12_PIPELINE_STATE_SUBOBJECT_TYPE base = type;
+        if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1
+                || type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2)
+            base = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL;
+        else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1)
+            base = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
+        if (seen & (1ull << base)) return E_INVALIDARG;
         seen |= 1ull << type;
         SIZE_T offset = Native12AlignStream(position + sizeof(type), alignment);
         if (offset > desc->SizeInBytes || desc->SizeInBytes - offset < size) return E_INVALIDARG;
         memcpy(target, stream + offset, size);
         position = Native12AlignStream(offset + size, sizeof(void *));
+        switch (type)
+        {
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER:
+                float_bias = false;
+                line_set = false;
+                break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1:
+            {
+                D3D12_RASTERIZER_DESC &raster = graphics.RasterizerState;
+                raster.FillMode = raster1.FillMode;
+                raster.CullMode = raster1.CullMode;
+                raster.FrontCounterClockwise = raster1.FrontCounterClockwise;
+                raster.DepthBias = static_cast<INT>(raster1.DepthBias);
+                raster.DepthBiasClamp = raster1.DepthBiasClamp;
+                raster.SlopeScaledDepthBias = raster1.SlopeScaledDepthBias;
+                raster.DepthClipEnable = raster1.DepthClipEnable;
+                raster.MultisampleEnable = raster1.MultisampleEnable;
+                raster.AntialiasedLineEnable = raster1.AntialiasedLineEnable;
+                raster.ForcedSampleCount = raster1.ForcedSampleCount;
+                raster.ConservativeRaster = raster1.ConservativeRaster;
+                float_bias = true;
+                bias = raster1.DepthBias;
+                line_set = false;
+                break;
+            }
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2:
+            {
+                D3D12_RASTERIZER_DESC &raster = graphics.RasterizerState;
+                if (raster2.LineRasterizationMode > D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW
+                        || (raster2.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_NARROW
+                        && ddi_build < D3D12DDI_BUILD_VERSION_0102))
+                    return E_INVALIDARG;
+                raster.FillMode = raster2.FillMode;
+                raster.CullMode = raster2.CullMode;
+                raster.FrontCounterClockwise = raster2.FrontCounterClockwise;
+                raster.DepthBias = static_cast<INT>(raster2.DepthBias);
+                raster.DepthBiasClamp = raster2.DepthBiasClamp;
+                raster.SlopeScaledDepthBias = raster2.SlopeScaledDepthBias;
+                raster.DepthClipEnable = raster2.DepthClipEnable;
+                raster.MultisampleEnable =
+                        raster2.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE;
+                raster.AntialiasedLineEnable =
+                        raster2.LineRasterizationMode == D3D12_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED;
+                raster.ForcedSampleCount = raster2.ForcedSampleCount;
+                raster.ConservativeRaster = raster2.ConservativeRaster;
+                float_bias = true;
+                bias = raster2.DepthBias;
+                line_set = true;
+                line = raster2.LineRasterizationMode;
+                break;
+            }
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL:
+                depth.DepthBoundsTestEnable = FALSE;
+                face_masks = false;
+                break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1:
+                face_masks = false;
+                break;
+            case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL2:
+            {
+                const D3D12_DEPTH_STENCILOP_DESC1 *sources[2] = { &depth2.FrontFace, &depth2.BackFace };
+                D3D12_DEPTH_STENCILOP_DESC *destinations[2] = { &depth.FrontFace, &depth.BackFace };
+                depth.DepthEnable = depth2.DepthEnable;
+                depth.DepthWriteMask = depth2.DepthWriteMask;
+                depth.DepthFunc = depth2.DepthFunc;
+                depth.StencilEnable = depth2.StencilEnable;
+                depth.StencilReadMask = depth2.FrontFace.StencilReadMask;
+                depth.StencilWriteMask = depth2.FrontFace.StencilWriteMask;
+                for (UINT i = 0; i < 2; ++i)
+                {
+                    destinations[i]->StencilFailOp = sources[i]->StencilFailOp;
+                    destinations[i]->StencilDepthFailOp = sources[i]->StencilDepthFailOp;
+                    destinations[i]->StencilPassOp = sources[i]->StencilPassOp;
+                    destinations[i]->StencilFunc = sources[i]->StencilFunc;
+                }
+                depth.DepthBoundsTestEnable = depth2.DepthBoundsTestEnable;
+                face_masks = true;
+                back_read = depth2.BackFace.StencilReadMask;
+                back_write = depth2.BackFace.StencilWriteMask;
+                break;
+            }
+            default:
+                break;
+        }
     }
 
-    if (view_instancing.ViewInstanceCount || amplification.BytecodeLength || mesh.BytecodeLength)
+    if (amplification.BytecodeLength || mesh.BytecodeLength) return E_INVALIDARG;
+    if (!compute_shader.BytecodeLength
+            && !Native12ViewInstancingValid(view_instancing, highest_shader_model, options.ViewInstancingTier))
         return E_INVALIDARG;
     if (targets.NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return E_INVALIDARG;
 
-    Native12PipelineState *pipeline = new Native12PipelineState(this);
-    if (!pipeline) return E_OUTOFMEMORY;
     HRESULT hr;
     if (compute_shader.BytecodeLength)
     {
-        if (graphics.VS.BytecodeLength)
-        {
-            pipeline->Release();
-            return E_INVALIDARG;
-        }
+        if (graphics.VS.BytecodeLength) return E_INVALIDARG;
         D3D12_COMPUTE_PIPELINE_STATE_DESC compute = {};
         compute.pRootSignature = graphics.pRootSignature;
         compute.CS = compute_shader;
@@ -173,8 +273,30 @@ HRESULT STDMETHODCALLTYPE Native12Device::CreatePipelineState(const D3D12_PIPELI
         graphics.CachedPSO = cached;
         graphics.Flags = flags;
         pipeline->depth_bounds_test = depth.DepthBoundsTestEnable;
+        pipeline->face_stencil_masks = face_masks;
+        pipeline->back_stencil_read_mask = back_read;
+        pipeline->back_stencil_write_mask = back_write;
+        pipeline->float_depth_bias = float_bias;
+        pipeline->depth_bias = bias;
+        pipeline->line_mode_set = line_set;
+        pipeline->line_mode = line;
+        pipeline->view_instance_count = view_instancing.ViewInstanceCount;
+        for (UINT i = 0; i < view_instancing.ViewInstanceCount && view_instancing.pViewInstanceLocations; ++i)
+            pipeline->view_instance_locations[i] = view_instancing.pViewInstanceLocations[i];
+        pipeline->view_instancing_flags = view_instancing.Flags;
         hr = pipeline->InitializeGraphics(&graphics);
     }
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Native12Device::CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC *desc,
+        REFIID iid, void **out)
+{
+    if (!desc || !out || (desc->SizeInBytes && !desc->pPipelineStateSubobjectStream)) return E_INVALIDARG;
+    *out = NULL;
+    Native12PipelineState *pipeline = new Native12PipelineState(this);
+    if (!pipeline) return E_OUTOFMEMORY;
+    HRESULT hr = InitializePipelineState(pipeline, desc);
     if (SUCCEEDED(hr)) hr = pipeline->QueryInterface(iid, out);
     pipeline->Release();
     return hr;
@@ -216,10 +338,9 @@ HRESULT STDMETHODCALLTYPE Native12Device::CreateCommandList1(UINT, D3D12_COMMAND
 }
 
 HRESULT STDMETHODCALLTYPE Native12Device::CreateProtectedResourceSession(const D3D12_PROTECTED_RESOURCE_SESSION_DESC *,
-        REFIID, void **out)
+        REFIID, void **)
 {
-    if (out) *out = NULL;
-    return DXGI_ERROR_UNSUPPORTED;
+    return E_INVALIDARG;
 }
 
 HRESULT STDMETHODCALLTYPE Native12Device::CreateCommittedResource1(const D3D12_HEAP_PROPERTIES *properties,

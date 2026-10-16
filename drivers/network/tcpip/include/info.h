@@ -7,6 +7,9 @@
 
 #pragma once
 
+NTSTATUS
+InfoIp6QueryTable(ULONG TableId, PVOID Buffer, ULONG Length, PULONG Information);
+
 #include <tcpioctl.h>
 /* FIXME */
 #define DWORD ULONG
@@ -111,6 +114,10 @@ TDI_STATUS InfoTdiQueryGetInterfaceMIB(TDIEntityID ID,
 				       PNDIS_BUFFER Buffer,
 				       PUINT BufferSize);
 
+TDI_STATUS InfoTdiQueryGetIFInfo(PVOID Context,
+                                 PNDIS_BUFFER Buffer,
+                                 PUINT BufferSize);
+
 TDI_STATUS InfoTdiQueryGetIPSnmpInfo( TDIEntityID ID,
                                       PIP_INTERFACE IF,
 				      PNDIS_BUFFER Buffer,
@@ -129,6 +136,10 @@ TDI_STATUS InfoTdiQueryGetConnectionUdpTable( PADDRESS_FILE AddrFile,
                                               PNDIS_BUFFER Buffer,
                                               PUINT BufferSize,
                                               TDI_TCPUDP_CLASS_INFO Class);
+
+TDI_STATUS InfoTdiSetConnectionTcp(PADDRESS_FILE AddrFile,
+                                   PVOID Buffer,
+                                   UINT BufferSize);
 
 TDI_STATUS InfoTdiSetRoute(PIP_INTERFACE IF,
                            PVOID Buffer,

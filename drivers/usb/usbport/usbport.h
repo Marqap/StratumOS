@@ -311,6 +311,7 @@ typedef struct _USBPORT_ENDPOINT {
   UCHAR Padded[2];
   LONG LockCounter;
   LONG FlushPendingLock;
+  LONG TimeoutPin;
   /* State */
   ULONG StateLast;
   ULONG StateNext;
@@ -570,6 +571,7 @@ typedef struct _USBPORT_DEVICE_EXTENSION {
       ULONG NextTimeSyncId;
       PVOID DumpContext;
       PUSBPORT_TT_CLEAR_RUNDOWN TtClearRundown;
+      PVOID KeyboardContext;
     } Aux;
   };
 #else
@@ -583,6 +585,7 @@ typedef struct _USBPORT_DEVICE_EXTENSION {
       ULONG NextTimeSyncId;
       PVOID DumpContext;
       PUSBPORT_TT_CLEAR_RUNDOWN TtClearRundown;
+      PVOID KeyboardContext;
     } Aux;
   };
 #endif
@@ -608,6 +611,9 @@ typedef struct _USBPORT_DUMP_CONTEXT {
   volatile LONG Completed;
   USBD_STATUS TransferStatus;
   ULONG CompletedLength;
+  BOOLEAN TransferPending;
+  ULONG StashLength;
+  UCHAR Stash[ROS_USB_KEYBOARD_BOOT_REPORT_SIZE];
 } USBPORT_DUMP_CONTEXT, *PUSBPORT_DUMP_CONTEXT;
 
 typedef struct _USBPORT_RH_DESCRIPTORS {

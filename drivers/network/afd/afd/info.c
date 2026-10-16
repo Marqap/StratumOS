@@ -68,9 +68,7 @@ AfdGetInfo( PDEVICE_OBJECT DeviceObject, PIRP Irp,
     _SEH2_TRY {
         switch( InfoReq->InformationClass ) {
         case AFD_INFO_RECEIVE_WINDOW_SIZE:
-            InfoReq->Information.Ulong = FCB->PendingReceiveWindowSize ?
-                                         FCB->PendingReceiveWindowSize :
-                                         FCB->Recv.Size;
+            InfoReq->Information.Ulong = FCB->ReportedReceiveWindowSize;
             break;
 
         case AFD_INFO_SEND_WINDOW_SIZE:
@@ -167,13 +165,12 @@ AfdSetInfo( PDEVICE_OBJECT DeviceObject, PIRP Irp,
                 {
                     /* FIXME: likely not right, check tcpip.sys for TDI_QUERY_MAX_DATAGRAM_INFO */
                     if (InfoReq->Information.Ulong > 0 && InfoReq->Information.Ulong < 0xFFFF &&
-                        InfoReq->Information.Ulong != (FCB->PendingReceiveWindowSize ?
-                                                       FCB->PendingReceiveWindowSize :
-                                                       FCB->Recv.Size))
+                        InfoReq->Information.Ulong != FCB->ReportedReceiveWindowSize)
                     {
                         if (InfoReq->Information.Ulong == FCB->Recv.Size)
                         {
                             FCB->PendingReceiveWindowSize = 0;
+                            FCB->ReportedReceiveWindowSize = InfoReq->Information.Ulong;
                             break;
                         }
 
@@ -185,6 +182,7 @@ AfdSetInfo( PDEVICE_OBJECT DeviceObject, PIRP Irp,
                         else
                         {
                             FCB->PendingReceiveWindowSize = InfoReq->Information.Ulong;
+                            FCB->ReportedReceiveWindowSize = InfoReq->Information.Ulong;
 
                             if (!FCB->ReceiveIrp.InFlightRequest)
                                 AfdTryApplyPendingReceiveWindow(FCB);
@@ -197,7 +195,13 @@ AfdSetInfo( PDEVICE_OBJECT DeviceObject, PIRP Irp,
                 }
                 else
                 {
-                    Status = STATUS_INVALID_PARAMETER;
+                    if (InfoReq->Information.Ulong > 0 && InfoReq->Information.Ulong < 0xFFFF &&
+                        !FCB->Recv.Window)
+                    {
+                        FCB->Recv.Size = InfoReq->Information.Ulong;
+                        FCB->ReportedReceiveWindowSize = InfoReq->Information.Ulong;
+                    }
+                    Status = STATUS_SUCCESS;
                 }
                 break;
             case AFD_INFO_SEND_WINDOW_SIZE:
@@ -208,13 +212,13 @@ AfdSetInfo( PDEVICE_OBJECT DeviceObject, PIRP Irp,
                         InfoReq->Information.Ulong != FCB->Send.Size)
                     {
                         NewBuffer = ExAllocatePoolWithTag(PagedPool,
-                                                          InfoReq->Information.Ulong,
+                                                          InfoReq->Information.Ulong * 2,
                                                           TAG_AFD_DATA_BUFFER);
 
                         if (NewBuffer)
                         {
-                            if (FCB->Send.BytesUsed > InfoReq->Information.Ulong)
-                                FCB->Send.BytesUsed = InfoReq->Information.Ulong;
+                            if (FCB->Send.BytesUsed > InfoReq->Information.Ulong * 2)
+                                FCB->Send.BytesUsed = InfoReq->Information.Ulong * 2;
 
                             if (FCB->Send.Window)
                             {
@@ -242,7 +246,7 @@ AfdSetInfo( PDEVICE_OBJECT DeviceObject, PIRP Irp,
                 }
                 else
                 {
-                    Status = STATUS_INVALID_PARAMETER;
+                    Status = STATUS_SUCCESS;
                 }
                 break;
             default:
@@ -257,6 +261,39 @@ AfdSetInfo( PDEVICE_OBJECT DeviceObject, PIRP Irp,
     AFD_DbgPrint(MID_TRACE,("Returning %x\n", Status));
 
     return UnlockAndMaybeComplete(FCB, Status, Irp, 0);
+}
+
+static
+VOID
+AfdReportConnectedSource(
+    _In_ PAFD_FCB FCB,
+    _In_ PIRP Irp,
+    _In_ PIO_STACK_LOCATION IrpSp)
+{
+    PTDI_ADDRESS_INFO Info = Irp->UserBuffer;
+    ULONG Length = IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+    PTDI_ADDRESS_IP Ip;
+
+    if (Length < FIELD_OFFSET(TDI_ADDRESS_INFO, Address.Address[0].Address) + sizeof(TDI_ADDRESS_IP))
+        return;
+
+    _SEH2_TRY
+    {
+        if (Irp->RequestorMode != KernelMode)
+            ProbeForWrite(Info, Length, 1);
+        if (Info->Address.TAAddressCount != 0 &&
+            Info->Address.Address[0].AddressType == TDI_ADDRESS_TYPE_IP &&
+            Info->Address.Address[0].AddressLength >= sizeof(TDI_ADDRESS_IP))
+        {
+            Ip = (PTDI_ADDRESS_IP)Info->Address.Address[0].Address;
+            if (Ip->in_addr == 0)
+                Ip->in_addr = FCB->ConnectedSourceAddress;
+        }
+    }
+    _SEH2_EXCEPT(EXCEPTION_EXECUTE_HANDLER)
+    {
+    }
+    _SEH2_END;
 }
 
 NTSTATUS NTAPI
@@ -302,6 +339,12 @@ AfdGetSockName( PDEVICE_OBJECT DeviceObject, PIRP Irp,
                     Status = TdiQueryInformation( FCB->AddressFile.Object,
                                                   TDI_QUERY_ADDRESS_INFO,
                                                   Mdl );
+                }
+
+                if (NT_SUCCESS(Status) && (FCB->Flags & AFD_ENDPOINT_CONNECTIONLESS) &&
+                    FCB->RemoteAddress && FCB->ConnectedSourceAddress)
+                {
+                    AfdReportConnectedSource(FCB, Irp, IrpSp);
                 }
         }
 

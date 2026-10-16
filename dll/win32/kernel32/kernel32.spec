@@ -8,6 +8,7 @@
 @ stdcall AddConsoleAliasW(wstr wstr wstr) kernelbase.AddConsoleAliasW
 @ stdcall AddLocalAlternateComputerNameA(str ptr)
 @ stdcall AddLocalAlternateComputerNameW(wstr ptr)
+@ stdcall -version=0xA00+ AddDependencyToProcessPackageGraph(wstr ptr ptr ptr) kernelbase.AddDependencyToProcessPackageGraph
 @ stdcall AddRefActCtx(ptr)
 @ stdcall -version=0x600+ AddSIDToBoundaryDescriptor(ptr ptr)
 @ stdcall -version=0x600+ BasepAdjustObjectAttributesForPrivateNamespace(ptr)
@@ -19,6 +20,8 @@
 @ stdcall AllocConsole() kernelbase.AllocConsole
 @ stdcall AllocateUserPhysicalPages(long ptr ptr)
 @ stdcall -stub -version=0x600+ AllocateUserPhysicalPagesNuma(ptr ptr ptr long)
+@ stdcall -version=0x602+ AppXFreeMemory(ptr) kernelbase.AppXFreeMemory
+@ stdcall -version=0x602+ AppXGetPackageSid(wstr ptr) kernelbase.AppXGetPackageSid
 @ stdcall -version=0x600+ ApplicationRecoveryFinished(long)
 @ stdcall -version=0x600+ ApplicationRecoveryInProgress(ptr)
 @ stdcall AreFileApisANSI()
@@ -32,6 +35,7 @@
 @ stdcall BaseCleanupAppcompatCacheSupport(ptr)
 @ stdcall BaseDumpAppcompatCache()
 @ stdcall BaseFlushAppcompatCache()
+@ stdcall -version=0x602+ BaseFreeAppCompatDataForProcess(ptr)
 @ stub -version=0x600+ BaseGenerateAppCompatData
 @ stdcall BaseGetNamedObjectDirectory(ptr)
 @ stdcall BaseInitAppcompatCacheSupport()
@@ -40,6 +44,7 @@
 @ stdcall -version=0x600+ BaseProcessInitPostImport() # HACK: This export is dynamicaly imported by ntdll
 ;@ stdcall -version=0x502 -arch=x86_64 BaseProcessStart()
 @ stdcall BaseQueryModuleData(str str ptr ptr ptr) ;check
+@ stdcall -version=0x602+ BaseReadAppCompatDataForProcess(ptr ptr ptr)
 @ stdcall -version=0x600+ BaseThreadInitThunk(long ptr ptr)
 ;@ stdcall -version=0x502 -arch=x86_64 BaseThreadStart()
 @ stdcall BaseUpdateAppcompatCache(long long long)
@@ -71,6 +76,7 @@
 @ stdcall CheckNameLegalDOS8Dot3A(str str long long long)
 @ stdcall CheckNameLegalDOS8Dot3W(wstr str long long long)
 @ stdcall CheckRemoteDebuggerPresent(long ptr)
+@ stdcall -version=0x602+ CheckTokenCapability(ptr ptr ptr) kernelbase.CheckTokenCapability
 @ stdcall ClearCommBreak(long)
 @ stdcall ClearCommError(long ptr ptr)
 @ stdcall CloseConsoleHandle(long) kernelbase.CloseConsoleHandle
@@ -255,16 +261,16 @@
 @ stdcall EnumLanguageGroupLocalesA(ptr long long ptr)
 @ stdcall EnumLanguageGroupLocalesW(ptr long long ptr)
 @ stdcall EnumResourceLanguagesA(long str str ptr long)
-@ stub -version=0x600+ EnumResourceLanguagesExA
-@ stub -version=0x600+ EnumResourceLanguagesExW
+@ stdcall -version=0x600+ EnumResourceLanguagesExA(long str str ptr long long long)
+@ stdcall -version=0x600+ EnumResourceLanguagesExW(long wstr wstr ptr long long long)
 @ stdcall EnumResourceLanguagesW(long wstr wstr ptr long)
 @ stdcall EnumResourceNamesA(long str ptr long)
-@ stub -version=0x600+ EnumResourceNamesExA
-@ stub -version=0x600+ EnumResourceNamesExW
+@ stdcall -version=0x600+ EnumResourceNamesExA(long str ptr long long long)
+@ stdcall -version=0x600+ EnumResourceNamesExW(long wstr ptr long long long)
 @ stdcall EnumResourceNamesW(long wstr ptr long)
 @ stdcall EnumResourceTypesA(long ptr long)
-@ stub -version=0x600+ EnumResourceTypesExA
-@ stub -version=0x600+ EnumResourceTypesExW
+@ stdcall -version=0x600+ EnumResourceTypesExA(long ptr long long long)
+@ stdcall -version=0x600+ EnumResourceTypesExW(long ptr long long long)
 @ stdcall EnumResourceTypesW(long ptr long)
 @ stdcall EnumSystemCodePagesA(ptr long)
 @ stdcall EnumSystemCodePagesW(ptr long)
@@ -546,6 +552,7 @@
 @ stdcall GetLocaleInfoW(long long ptr long)
 @ stdcall -arch=win64 GetNextUmsListItem(ptr)
 @ stdcall -version=0x602+ GetOsSafeBootMode(ptr)
+@ stdcall -version=0x602+ GetPackageFullName(long ptr ptr) kernelbase.GetPackageFullName
 @ stdcall -version=0x602+ GetStateSettingsFolder(ptr ptr ptr)
 @ stdcall -arch=win64 GetUmsCompletionListEvent(ptr ptr)
 @ stdcall -version=0x600+ IsValidLocaleName(wstr) kernelbase.IsValidLocaleName
@@ -961,6 +968,8 @@
 @ stdcall OpenWaitableTimerW(long long wstr)
 @ stdcall OutputDebugStringA(str)
 @ stdcall OutputDebugStringW(wstr)
+@ stdcall -version=0x602+ PackageFamilyNameFromFullName(wstr ptr ptr) kernelbase.PackageFamilyNameFromFullName
+@ stdcall -version=0x602+ ParseApplicationUserModelId(wstr ptr ptr ptr ptr) kernelbase.ParseApplicationUserModelId
 @ stdcall PeekConsoleInputA(ptr ptr long ptr) kernelbase.PeekConsoleInputA
 @ stdcall PeekConsoleInputW(ptr ptr long ptr) kernelbase.PeekConsoleInputW
 @ stdcall PeekNamedPipe(long ptr long ptr ptr ptr)
@@ -991,6 +1000,7 @@
 @ stdcall -version=0x600+ QueryFullProcessImageNameW(ptr long ptr ptr)
 @ stdcall -version=0x600+ QueryIdleProcessorCycleTime(ptr ptr)
 @ stdcall -version=0x601+ QueryIdleProcessorCycleTimeEx(long ptr ptr)
+@ stdcall -version=0x601+ GetProcessorSystemCycleTime(long ptr ptr)
 @ stdcall QueryInformationJobObject(long long ptr long ptr)
 @ stdcall QueryMemoryResourceNotification(ptr ptr)
 @ stdcall QueryPerformanceCounter(ptr)
@@ -1023,6 +1033,47 @@
 @ stdcall ReadFileEx(long ptr long ptr ptr)
 @ stdcall ReadFileScatter(long ptr long ptr ptr)
 @ stdcall ReadProcessMemory(long ptr ptr long ptr)
+@ stdcall RegCloseKey(long) kernelbase.RegCloseKey
+@ stdcall RegCopyTreeW(long wstr long) kernelbase.RegCopyTreeW
+@ stdcall RegCreateKeyExA(long str long ptr long long ptr ptr ptr) kernelbase.RegCreateKeyExA
+@ stdcall RegCreateKeyExW(long wstr long ptr long long ptr ptr ptr) kernelbase.RegCreateKeyExW
+@ stdcall RegDeleteKeyExA(long str long long) kernelbase.RegDeleteKeyExA
+@ stdcall RegDeleteKeyExW(long wstr long long) kernelbase.RegDeleteKeyExW
+@ stdcall RegDeleteTreeA(long str) kernelbase.RegDeleteTreeA
+@ stdcall RegDeleteTreeW(long wstr) kernelbase.RegDeleteTreeW
+@ stdcall RegDeleteValueA(long str) kernelbase.RegDeleteValueA
+@ stdcall RegDeleteValueW(long wstr) kernelbase.RegDeleteValueW
+@ stdcall RegDisablePredefinedCacheEx() advapi32.RegDisablePredefinedCacheEx
+@ stdcall RegEnumKeyExA(long long ptr ptr ptr ptr ptr ptr) kernelbase.RegEnumKeyExA
+@ stdcall RegEnumKeyExW(long long ptr ptr ptr ptr ptr ptr) kernelbase.RegEnumKeyExW
+@ stdcall RegEnumValueA(long long ptr ptr ptr ptr ptr ptr) kernelbase.RegEnumValueA
+@ stdcall RegEnumValueW(long long ptr ptr ptr ptr ptr ptr) kernelbase.RegEnumValueW
+@ stdcall RegFlushKey(long) kernelbase.RegFlushKey
+@ stdcall RegGetKeySecurity(long long ptr ptr) kernelbase.RegGetKeySecurity
+@ stdcall RegGetValueA(long str str long ptr ptr ptr) kernelbase.RegGetValueA
+@ stdcall RegGetValueW(long wstr wstr long ptr ptr ptr) kernelbase.RegGetValueW
+@ stdcall RegLoadKeyA(long str str) kernelbase.RegLoadKeyA
+@ stdcall RegLoadKeyW(long wstr wstr) kernelbase.RegLoadKeyW
+@ stdcall RegLoadMUIStringA(long str str long ptr long str) kernelbase.RegLoadMUIStringA
+@ stdcall RegLoadMUIStringW(long wstr wstr long ptr long wstr) kernelbase.RegLoadMUIStringW
+@ stdcall RegNotifyChangeKeyValue(long long long long long) kernelbase.RegNotifyChangeKeyValue
+@ stdcall RegOpenCurrentUser(long ptr) advapi32.RegOpenCurrentUser
+@ stdcall RegOpenKeyExA(long str long long ptr) kernelbase.RegOpenKeyExA
+@ stdcall RegOpenKeyExW(long wstr long long ptr) kernelbase.RegOpenKeyExW
+@ stdcall RegOpenUserClassesRoot(ptr long long ptr) kernelbase.RegOpenUserClassesRoot
+@ stdcall RegQueryInfoKeyA(long ptr ptr ptr ptr ptr ptr ptr ptr ptr ptr ptr) kernelbase.RegQueryInfoKeyA
+@ stdcall RegQueryInfoKeyW(long ptr ptr ptr ptr ptr ptr ptr ptr ptr ptr ptr) kernelbase.RegQueryInfoKeyW
+@ stdcall RegQueryValueExA(long str ptr ptr ptr ptr) kernelbase.RegQueryValueExA
+@ stdcall RegQueryValueExW(long wstr ptr ptr ptr ptr) kernelbase.RegQueryValueExW
+@ stdcall RegRestoreKeyA(long str long) kernelbase.RegRestoreKeyA
+@ stdcall RegRestoreKeyW(long wstr long) kernelbase.RegRestoreKeyW
+@ stdcall RegSaveKeyExA(long str ptr long) kernelbase.RegSaveKeyExA
+@ stdcall RegSaveKeyExW(long wstr ptr long) kernelbase.RegSaveKeyExW
+@ stdcall RegSetKeySecurity(long long ptr) kernelbase.RegSetKeySecurity
+@ stdcall RegSetValueExA(long str long long ptr long) kernelbase.RegSetValueExA
+@ stdcall RegSetValueExW(long wstr long long ptr long) kernelbase.RegSetValueExW
+@ stdcall RegUnLoadKeyA(long str) kernelbase.RegUnLoadKeyA
+@ stdcall RegUnLoadKeyW(long wstr) kernelbase.RegUnLoadKeyW
 @ stdcall -version=0x600+ RegisterApplicationRecoveryCallback(ptr ptr long long)
 @ stdcall -version=0x600+ RegisterApplicationRestart(wstr long)
 @ stdcall RegisterConsoleIME(ptr ptr) kernelbase.RegisterConsoleIME

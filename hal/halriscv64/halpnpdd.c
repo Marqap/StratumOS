@@ -13,6 +13,8 @@
 #include <ndk/iofuncs.h>
 #include <initguid.h>
 #include <wdmguid.h>
+#include <acpiioct.h>
+#include <reactos/drivers/reshubio.h>
 #include <reactos/riscv64/fdtlib.h>
 #include "halp.h"
 
@@ -26,12 +28,22 @@
 #define RISCV_PLATFORM_MAX_NAME 64
 #define RISCV_PLATFORM_MAX_DEPTH 6
 #define RISCV_PLATFORM_KEY_DEPTH 2
+#define RISCV_PLATFORM_MAX_GPIOS 8
+#define RISCV_PLATFORM_GPIO_DEPTH 2
+#define RISCV_ACPI_GPIO_DESCRIPTOR_LENGTH 26
+#define RISCV_ACPI_I2C_DESCRIPTOR_LENGTH 19
+#define RISCV_ACPI_UART_DESCRIPTOR_LENGTH 23
+#define RISCV_I2C_DEFAULT_SPEED 100000
+#define RISCV_UART_DEFAULT_SPEED 115200
 
 typedef struct _RISCV_PLATFORM_EXTENSION
 {
     ULONG Type;
     PDEVICE_OBJECT LowerDevice;
     PDEVICE_OBJECT ChildDevice;
+    PDEVICE_OBJECT Pdo;
+    PDEVICE_OBJECT Controller;
+    BOOLEAN Started;
     ULONG FirstBus;
     ULONG LastBus;
     ULONG Node;
@@ -48,6 +60,10 @@ typedef struct _RISCV_FDT_DEVICE
     ULONG64 MemorySize[RISCV_PLATFORM_MAX_MEMORY];
     ULONG InterruptCount;
     ULONG Interrupt[RISCV_PLATFORM_MAX_INTERRUPTS];
+    ULONG GpioCount;
+    ULONG GpioController[RISCV_PLATFORM_MAX_GPIOS];
+    USHORT GpioPin[RISCV_PLATFORM_MAX_GPIOS];
+    ULONG64 GpioConnectionId[RISCV_PLATFORM_MAX_GPIOS];
 } RISCV_FDT_DEVICE;
 
 static RISCV_FDT HalpRiscvPlatformFdt;
@@ -55,6 +71,13 @@ static ULONG HalpRiscvPlatformSoc = RISCV_FDT_NO_NODE;
 static BOOLEAN HalpRiscvPlatformFdtOpen;
 static PDRIVER_OBJECT HalpRiscvPlatformDriver;
 static ULONG64 HalpRiscvDebuggerBase;
+static RISCV_PLATFORM_EXTENSION *HalpRiscvPlatformBus;
+
+static ULONG
+HalpRiscvFdtFindPhandle(_In_ ULONG Phandle);
+
+static BOOLEAN
+HalpRiscvFdtDescribe(_In_ ULONG Node, _In_ ULONG Bus, _Out_ RISCV_FDT_DEVICE *Device);
 
 static NTSTATUS
 HalpRiscvCopyId(_In_reads_bytes_(Size) const WCHAR *Source,
@@ -150,6 +173,320 @@ HalpRiscvFdtDmaTopology(_In_reads_(Depth) const ULONG *Path, _In_ ULONG Depth,
 }
 
 static BOOLEAN
+HalpRiscvFdtIsI2cController(_In_ ULONG Node)
+{
+    const CHAR *List, *Entry;
+    ULONG Length, Cursor = 0, EntryLength, Index;
+
+    if (Node == RISCV_FDT_NO_NODE)
+        return FALSE;
+    List = RiscvFdtGetProperty(&HalpRiscvPlatformFdt, Node, "compatible", &Length);
+    while ((Entry = RiscvFdtNextString(List, Length, &Cursor, &EntryLength)) != NULL)
+    {
+        for (Index = 0; Index + 3 <= EntryLength; ++Index)
+        {
+            if ((Entry[Index] == 'i' && Entry[Index + 1] == '2' && Entry[Index + 2] == 'c') ||
+                (Index + 4 <= EntryLength && Entry[Index] == 't' && Entry[Index + 1] == 'w' &&
+                 Entry[Index + 2] == 's' && Entry[Index + 3] == 'i'))
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOLEAN
+HalpRiscvFdtIsUartController(_In_ ULONG Node)
+{
+    const CHAR *List, *Entry, *Name;
+    ULONG Length, Cursor = 0, EntryLength, Index, NameLength = 0;
+
+    if (Node == RISCV_FDT_NO_NODE)
+        return FALSE;
+    Name = RiscvFdtNodeName(&HalpRiscvPlatformFdt, Node, &NameLength);
+    if (Name && NameLength >= 6 && RtlEqualMemory(Name, "serial", 6) && (NameLength == 6 || Name[6] == '@'))
+        return TRUE;
+    List = RiscvFdtGetProperty(&HalpRiscvPlatformFdt, Node, "compatible", &Length);
+    while ((Entry = RiscvFdtNextString(List, Length, &Cursor, &EntryLength)) != NULL)
+    {
+        for (Index = 0; Index + 4 <= EntryLength; ++Index)
+        {
+            if (Entry[Index] == 'u' && Entry[Index + 1] == 'a' && Entry[Index + 2] == 'r' && Entry[Index + 3] == 't')
+                return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static UCHAR
+HalpRiscvFdtSerialBusType(_In_ ULONG Node)
+{
+    if (HalpRiscvFdtIsI2cController(Node))
+        return CM_RESOURCE_CONNECTION_TYPE_SERIAL_I2C;
+    if (HalpRiscvFdtIsUartController(Node))
+        return CM_RESOURCE_CONNECTION_TYPE_SERIAL_UART;
+    return 0;
+}
+
+static BOOLEAN
+HalpRiscvFdtIsGpioProperty(_In_z_ const CHAR *Name)
+{
+    SIZE_T Length = strlen(Name);
+
+    if (Name[0] == '#')
+        return FALSE;
+    if (Length == 5 && !strcmp(Name, "gpios"))
+        return TRUE;
+    if (Length > 6 && !strcmp(Name + Length - 6, "-gpios"))
+        return TRUE;
+    return Length > 5 && !strcmp(Name + Length - 5, "-gpio");
+}
+
+static ULONG64
+HalpRiscvFdtGpioConnectionId(_In_ ULONG Node, _In_z_ const CHAR *Name, _In_ ULONG Index)
+{
+    ULONG64 Hash = 1469598103934665603ULL;
+    ULONG Value, Byte;
+
+    for (Value = Node, Byte = 0; Byte < sizeof(ULONG); ++Byte, Value >>= 8)
+        Hash = (Hash ^ (Value & 0xFF)) * 1099511628211ULL;
+    for (; *Name; ++Name)
+        Hash = (Hash ^ (UCHAR)*Name) * 1099511628211ULL;
+    for (Value = Index, Byte = 0; Byte < sizeof(ULONG); ++Byte, Value >>= 8)
+        Hash = (Hash ^ (Value & 0xFF)) * 1099511628211ULL;
+    if ((Hash >> 32) == (RH_SECONDARY_INTERRUPT_CONNECTION_ID(0) >> 32))
+        Hash ^= 1ULL << 61;
+    return Hash ? Hash : 1;
+}
+
+static VOID
+HalpRiscvFdtCollectGpios(_In_ ULONG Node, _In_ ULONG Depth, _Inout_ RISCV_FDT_DEVICE *Device)
+{
+    const RISCV_FDT *Fdt = &HalpRiscvPlatformFdt;
+    ULONG Offset, Child, Length;
+    const VOID *Status;
+
+    if (RiscvFdtToken(Fdt, Node) != RISCV_FDT_BEGIN_NODE)
+        return;
+    for (Offset = RiscvFdtSkipToken(Fdt, Node); Offset != RISCV_FDT_NO_NODE; Offset = RiscvFdtSkipToken(Fdt, Offset))
+    {
+        ULONG Token = RiscvFdtToken(Fdt, Offset);
+        const UCHAR *Header, *Value;
+        ULONG ValueLength, NameOffset, Cell, Cells, Specifier = 0;
+        const CHAR *Name;
+
+        if (Token == RISCV_FDT_NOP)
+            continue;
+        if (Token != RISCV_FDT_PROPERTY || Offset > Fdt->StructureSize - 3 * sizeof(ULONG))
+            break;
+        Header = Fdt->Blob + Fdt->StructureOffset + Offset + sizeof(ULONG);
+        ValueLength = RiscvFdtReadBigEndian32(Header);
+        NameOffset = RiscvFdtReadBigEndian32(Header + sizeof(ULONG));
+        if (NameOffset >= Fdt->StringsSize || ValueLength > Fdt->StructureSize - (Offset + 3 * sizeof(ULONG)))
+            break;
+        Name = (const CHAR *)(Fdt->Blob + Fdt->StringsOffset + NameOffset);
+        if (!memchr(Name, '\0', Fdt->StringsSize - NameOffset) || !HalpRiscvFdtIsGpioProperty(Name))
+            continue;
+        Value = Header + 2 * sizeof(ULONG);
+        Cells = ValueLength / sizeof(ULONG);
+        for (Cell = 0; Cell < Cells; ++Specifier)
+        {
+            ULONG Phandle = RiscvFdtReadBigEndian32(Value + Cell * sizeof(ULONG));
+            ULONG Controller, GpioCells = 2;
+
+            if (!Phandle)
+            {
+                ++Cell;
+                continue;
+            }
+            Controller = HalpRiscvFdtFindPhandle(Phandle);
+            if (Controller == RISCV_FDT_NO_NODE)
+                break;
+            RiscvFdtReadU32(Fdt, Controller, "#gpio-cells", &GpioCells);
+            if (!GpioCells || GpioCells > Cells - Cell - 1)
+                break;
+            if (RiscvFdtGetProperty(Fdt, Controller, "gpio-controller", &Length) &&
+                Device->GpioCount < RISCV_PLATFORM_MAX_GPIOS)
+            {
+                ULONG Pin = RiscvFdtReadBigEndian32(Value + (Cell + 1) * sizeof(ULONG));
+
+                if (Pin <= MAXUSHORT)
+                {
+                    Device->GpioController[Device->GpioCount] = Controller;
+                    Device->GpioPin[Device->GpioCount] = (USHORT)Pin;
+                    Device->GpioConnectionId[Device->GpioCount++] =
+                        HalpRiscvFdtGpioConnectionId(Node, Name, Specifier);
+                }
+            }
+            Cell += 1 + GpioCells;
+        }
+    }
+    if (Depth >= RISCV_PLATFORM_GPIO_DEPTH)
+        return;
+    for (Child = RiscvFdtFirstChild(Fdt, Node); Child != RISCV_FDT_NO_NODE; Child = RiscvFdtNextSibling(Fdt, Child))
+    {
+        Status = RiscvFdtGetProperty(Fdt, Child, "status", &Length);
+        if (Status && !RiscvFdtStringListContains(Status, Length, "okay") &&
+            !RiscvFdtStringListContains(Status, Length, "ok"))
+            continue;
+        HalpRiscvFdtCollectGpios(Child, Depth + 1, Device);
+    }
+}
+
+static PDEVICE_OBJECT
+HalpRiscvFdtFindDevice(_In_ ULONG Node)
+{
+    ULONG Index;
+
+    if (!HalpRiscvPlatformBus)
+        return NULL;
+    for (Index = 0; Index < HalpRiscvPlatformBus->ChildCount; ++Index)
+    {
+        PDEVICE_OBJECT Child = HalpRiscvPlatformBus->Children[Index];
+        RISCV_PLATFORM_EXTENSION *Extension = Child->DeviceExtension;
+
+        if (Extension->Type == RISCV_PLATFORM_FDT && Extension->Node == Node)
+            return Child;
+    }
+    return NULL;
+}
+
+static NTSTATUS
+HalpRiscvFdtSendConnection(_In_ PDEVICE_OBJECT HubDevice, _In_ ULONG64 ConnectionId, _In_ UCHAR Class,
+                           _In_ UCHAR Type, _In_ PDEVICE_OBJECT Controller,
+                           _In_reads_bytes_(Length) const UCHAR *Properties, _In_ ULONG Length)
+{
+    PRH_REGISTER_CONNECTION_INPUT Input;
+    IO_STATUS_BLOCK IoStatus;
+    ULONG InputLength;
+    NTSTATUS Status;
+    KEVENT Event;
+    PIRP Irp;
+
+    InputLength = FIELD_OFFSET(RH_REGISTER_CONNECTION_INPUT, Properties) + Length;
+    Input = ExAllocatePoolWithTag(PagedPool, InputLength, RISCV_PLATFORM_TAG);
+    if (!Input)
+        return STATUS_INSUFFICIENT_RESOURCES;
+    RtlZeroMemory(Input, FIELD_OFFSET(RH_REGISTER_CONNECTION_INPUT, Properties));
+    Input->Version = RH_REGISTER_CONNECTION_VERSION;
+    Input->ConnectionId.QuadPart = (LONGLONG)ConnectionId;
+    Input->Class = Class;
+    Input->Type = Type;
+    Input->ControllerDevice = Controller;
+    Input->PropertiesLength = Length;
+    RtlCopyMemory(Input->Properties, Properties, Length);
+    KeInitializeEvent(&Event, NotificationEvent, FALSE);
+    Irp = IoBuildDeviceIoControlRequest(IOCTL_RH_REGISTER_CONNECTION, HubDevice, Input, InputLength,
+                                        NULL, 0, FALSE, &Event, &IoStatus);
+    if (!Irp)
+    {
+        ExFreePoolWithTag(Input, RISCV_PLATFORM_TAG);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+    Status = IoCallDriver(HubDevice, Irp);
+    if (Status == STATUS_PENDING)
+    {
+        KeWaitForSingleObject(&Event, Executive, KernelMode, FALSE, NULL);
+        Status = IoStatus.Status;
+    }
+    ExFreePoolWithTag(Input, RISCV_PLATFORM_TAG);
+    if (!NT_SUCCESS(Status))
+        DbgPrint("RISC-V FDT: connection %I64x not registered (0x%lx)\n", ConnectionId, Status);
+    return Status;
+}
+
+static VOID
+HalpRiscvFdtRegisterConnections(_In_ ULONG Node, _In_ ULONG Bus)
+{
+    static const UNICODE_STRING ResourceHubName = RTL_CONSTANT_STRING(RESOURCE_HUB_DEVICE_NAME);
+    RISCV_FDT_DEVICE Device;
+    PFILE_OBJECT FileObject;
+    PDEVICE_OBJECT HubDevice, Controller;
+    UCHAR SerialBus = HalpRiscvFdtSerialBusType(Bus);
+    ULONG Index;
+    NTSTATUS Status;
+
+    if (!HalpRiscvFdtDescribe(Node, Bus, &Device) || (!Device.GpioCount && !SerialBus))
+        return;
+    Status = IoGetDeviceObjectPointer((PUNICODE_STRING)&ResourceHubName, FILE_READ_DATA | FILE_WRITE_DATA,
+                                      &FileObject, &HubDevice);
+    if (!NT_SUCCESS(Status))
+    {
+        DbgPrint("RISC-V FDT: no resource hub for connections (0x%lx)\n", Status);
+        return;
+    }
+    for (Index = 0; Index < Device.GpioCount; ++Index)
+    {
+        UCHAR Descriptor[RISCV_ACPI_GPIO_DESCRIPTOR_LENGTH] = { 0 };
+
+        Controller = HalpRiscvFdtFindDevice(Device.GpioController[Index]);
+        if (!Controller)
+            continue;
+        Descriptor[0] = 0x8C;
+        Descriptor[1] = RISCV_ACPI_GPIO_DESCRIPTOR_LENGTH - 3;
+        Descriptor[3] = 1;
+        Descriptor[4] = 1;
+        Descriptor[5] = 1;
+        Descriptor[14] = 23;
+        Descriptor[17] = 25;
+        Descriptor[19] = 26;
+        Descriptor[23] = (UCHAR)Device.GpioPin[Index];
+        Descriptor[24] = (UCHAR)(Device.GpioPin[Index] >> 8);
+        HalpRiscvFdtSendConnection(HubDevice, Device.GpioConnectionId[Index], CM_RESOURCE_CONNECTION_CLASS_GPIO,
+                                   CM_RESOURCE_CONNECTION_TYPE_GPIO_IO, Controller, Descriptor, sizeof(Descriptor));
+    }
+    Controller = SerialBus ? HalpRiscvFdtFindDevice(Bus) : NULL;
+    if (Controller && SerialBus == CM_RESOURCE_CONNECTION_TYPE_SERIAL_UART)
+    {
+        UCHAR Descriptor[RISCV_ACPI_UART_DESCRIPTOR_LENGTH] = { 0 };
+        ULONG Speed = RISCV_UART_DEFAULT_SPEED, Length;
+        BOOLEAN RtsCts = RiscvFdtGetProperty(&HalpRiscvPlatformFdt, Bus, "uart-has-rtscts", &Length) != NULL;
+
+        RiscvFdtReadU32(&HalpRiscvPlatformFdt, Node, "max-speed", &Speed);
+        Descriptor[0] = 0x8E;
+        Descriptor[1] = RISCV_ACPI_UART_DESCRIPTOR_LENGTH - 3;
+        Descriptor[3] = 2;
+        Descriptor[5] = 3;
+        Descriptor[6] = 2;
+        Descriptor[7] = (UCHAR)((3 << 4) | (1 << 2) | (RtsCts ? 1 : 0));
+        Descriptor[9] = 1;
+        Descriptor[10] = 10;
+        Descriptor[12] = (UCHAR)Speed;
+        Descriptor[13] = (UCHAR)(Speed >> 8);
+        Descriptor[14] = (UCHAR)(Speed >> 16);
+        Descriptor[15] = (UCHAR)(Speed >> 24);
+        Descriptor[21] = RtsCts ? 0xC0 : 0;
+        HalpRiscvFdtSendConnection(HubDevice, HalpRiscvFdtGpioConnectionId(Node, "uart", 0),
+                                   CM_RESOURCE_CONNECTION_CLASS_SERIAL, CM_RESOURCE_CONNECTION_TYPE_SERIAL_UART,
+                                   Controller, Descriptor, sizeof(Descriptor));
+    }
+    else if (Controller)
+    {
+        UCHAR Descriptor[RISCV_ACPI_I2C_DESCRIPTOR_LENGTH] = { 0 };
+        ULONG Address = 0, Speed = RISCV_I2C_DEFAULT_SPEED;
+
+        RiscvFdtReadU32(&HalpRiscvPlatformFdt, Node, "reg", &Address);
+        RiscvFdtReadU32(&HalpRiscvPlatformFdt, Bus, "clock-frequency", &Speed);
+        Descriptor[0] = 0x8E;
+        Descriptor[1] = RISCV_ACPI_I2C_DESCRIPTOR_LENGTH - 3;
+        Descriptor[3] = 2;
+        Descriptor[5] = 1;
+        Descriptor[6] = 2;
+        Descriptor[9] = 1;
+        Descriptor[10] = 6;
+        Descriptor[12] = (UCHAR)Speed;
+        Descriptor[13] = (UCHAR)(Speed >> 8);
+        Descriptor[14] = (UCHAR)(Speed >> 16);
+        Descriptor[15] = (UCHAR)(Speed >> 24);
+        Descriptor[16] = (UCHAR)Address;
+        Descriptor[17] = (UCHAR)(Address >> 8);
+        HalpRiscvFdtSendConnection(HubDevice, HalpRiscvFdtGpioConnectionId(Node, "i2c", 0),
+                                   CM_RESOURCE_CONNECTION_CLASS_SERIAL, CM_RESOURCE_CONNECTION_TYPE_SERIAL_I2C,
+                                   Controller, Descriptor, sizeof(Descriptor));
+    }
+    ObDereferenceObject(FileObject);
+}
+
+static BOOLEAN
 HalpRiscvFdtDescribe(_In_ ULONG Node, _In_ ULONG Bus, _Out_ RISCV_FDT_DEVICE *Device)
 {
     const RISCV_FDT *Fdt = &HalpRiscvPlatformFdt;
@@ -167,8 +504,10 @@ HalpRiscvFdtDescribe(_In_ ULONG Node, _In_ ULONG Bus, _Out_ RISCV_FDT_DEVICE *De
         RiscvFdtStringListContains(Property, Length, "pci-host-ecam-generic") ||
         RiscvFdtStringListContains(Property, Length, "starfive,jh7110-pcie") ||
         RiscvFdtStringListContains(Property, Length, "google,goldfish-rtc") ||
-        RiscvFdtGetProperty(Fdt, Node, "interrupt-controller", &Length))
+        (RiscvFdtGetProperty(Fdt, Node, "interrupt-controller", &Length) &&
+         !RiscvFdtGetProperty(Fdt, Node, "gpio-controller", &Length)))
         return FALSE;
+    HalpRiscvFdtCollectGpios(Node, 0, Device);
 
     for (Index = 0; Index < RISCV_PLATFORM_MAX_MEMORY; ++Index)
     {
@@ -195,7 +534,7 @@ HalpRiscvFdtDescribe(_In_ ULONG Node, _In_ ULONG Bus, _Out_ RISCV_FDT_DEVICE *De
             if (Device->InterruptCount < RISCV_PLATFORM_MAX_INTERRUPTS)
                 Device->Interrupt[Device->InterruptCount++] = Source;
         }
-        return Device->MemoryCount || Device->InterruptCount ||
+        return Device->MemoryCount || Device->InterruptCount || Device->GpioCount ||
                RiscvFdtFirstChild(Fdt, Node) != RISCV_FDT_NO_NODE;
     }
 
@@ -215,8 +554,8 @@ HalpRiscvFdtDescribe(_In_ ULONG Node, _In_ ULONG Bus, _Out_ RISCV_FDT_DEVICE *De
                 Device->Interrupt[Device->InterruptCount++] = Source;
         }
     }
-    return Device->MemoryCount || Device->InterruptCount ||
-           RiscvFdtFirstChild(Fdt, Node) != RISCV_FDT_NO_NODE;
+    return Device->MemoryCount || Device->InterruptCount || Device->GpioCount ||
+           RiscvFdtFirstChild(Fdt, Node) != RISCV_FDT_NO_NODE || HalpRiscvFdtSerialBusType(Bus);
 }
 
 static NTSTATUS
@@ -272,6 +611,25 @@ HalpRiscvFdtInstanceId(_In_ ULONG Node, _In_ ULONG Bus, _Out_ PULONG_PTR Informa
 
     if (!HalpRiscvFdtDescribe(Node, Bus, &Device))
         return STATUS_NO_SUCH_DEVICE;
+    if (HalpRiscvFdtSerialBusType(Bus))
+    {
+        ULONG64 Base = 0, Size;
+        ULONG Address = 0;
+
+        RiscvFdtReadReg(&HalpRiscvPlatformFdt, Bus, HalpRiscvPlatformSoc, 0, &Base, &Size);
+        RiscvFdtReadU32(&HalpRiscvPlatformFdt, Node, "reg", &Address);
+        Id = ExAllocatePoolWithTag(PagedPool, 22 * sizeof(WCHAR), RISCV_PLATFORM_TAG);
+        if (!Id)
+            return STATUS_INSUFFICIENT_RESOURCES;
+        for (Index = 0; Index < 16; ++Index)
+            Id[Index] = Digits[(Base >> (60 - 4 * Index)) & 15];
+        Id[16] = L'-';
+        for (Index = 0; Index < 4; ++Index)
+            Id[17 + Index] = Digits[(Address >> (12 - 4 * Index)) & 15];
+        Id[21] = UNICODE_NULL;
+        *Information = (ULONG_PTR)Id;
+        return STATUS_SUCCESS;
+    }
     if (!Device.MemoryCount)
     {
         ULONG NameLength;
@@ -310,7 +668,7 @@ HalpRiscvFdtResources(_In_ ULONG Node, _In_ ULONG Bus, _Out_ PULONG_PTR Informat
 
     if (!HalpRiscvFdtDescribe(Node, Bus, &Device))
         return STATUS_NO_SUCH_DEVICE;
-    Count = Device.MemoryCount + Device.InterruptCount;
+    Count = Device.MemoryCount + Device.InterruptCount + Device.GpioCount + (HalpRiscvFdtSerialBusType(Bus) ? 1 : 0);
     Size = FIELD_OFFSET(CM_RESOURCE_LIST, List[0].PartialResourceList.PartialDescriptors) +
            Count * sizeof(CM_PARTIAL_RESOURCE_DESCRIPTOR);
     List = ExAllocatePoolWithTag(PagedPool, Size, RISCV_PLATFORM_TAG);
@@ -341,6 +699,27 @@ HalpRiscvFdtResources(_In_ ULONG Node, _In_ ULONG Bus, _Out_ PULONG_PTR Informat
         Resource->u.Interrupt.Vector = Device.Interrupt[Index];
         Resource->u.Interrupt.Affinity = 1;
     }
+    for (Index = 0; Index < Device.GpioCount; ++Index, ++Resource)
+    {
+        Resource->Type = CmResourceTypeConnection;
+        Resource->ShareDisposition = CmResourceShareShared;
+        Resource->u.Connection.Class = CM_RESOURCE_CONNECTION_CLASS_GPIO;
+        Resource->u.Connection.Type = CM_RESOURCE_CONNECTION_TYPE_GPIO_IO;
+        Resource->u.Connection.IdLowPart = (ULONG)Device.GpioConnectionId[Index];
+        Resource->u.Connection.IdHighPart = (ULONG)(Device.GpioConnectionId[Index] >> 32);
+    }
+    if (HalpRiscvFdtSerialBusType(Bus))
+    {
+        UCHAR SerialBus = HalpRiscvFdtSerialBusType(Bus);
+        ULONG64 Id = HalpRiscvFdtGpioConnectionId(Node, SerialBus == CM_RESOURCE_CONNECTION_TYPE_SERIAL_UART ? "uart" : "i2c", 0);
+
+        Resource->Type = CmResourceTypeConnection;
+        Resource->ShareDisposition = CmResourceShareShared;
+        Resource->u.Connection.Class = CM_RESOURCE_CONNECTION_CLASS_SERIAL;
+        Resource->u.Connection.Type = SerialBus;
+        Resource->u.Connection.IdLowPart = (ULONG)Id;
+        Resource->u.Connection.IdHighPart = (ULONG)(Id >> 32);
+    }
     *Information = (ULONG_PTR)List;
     return STATUS_SUCCESS;
 }
@@ -356,7 +735,7 @@ HalpRiscvFdtRequirements(_In_ ULONG Node, _In_ ULONG Bus, _Out_ PULONG_PTR Infor
 
     if (!HalpRiscvFdtDescribe(Node, Bus, &Device))
         return STATUS_NO_SUCH_DEVICE;
-    Count = Device.MemoryCount + Device.InterruptCount;
+    Count = Device.MemoryCount + Device.InterruptCount + Device.GpioCount + (HalpRiscvFdtSerialBusType(Bus) ? 1 : 0);
     Size = FIELD_OFFSET(IO_RESOURCE_REQUIREMENTS_LIST, List[0].Descriptors) +
            Count * sizeof(IO_RESOURCE_DESCRIPTOR);
     List = ExAllocatePoolWithTag(PagedPool, Size, RISCV_PLATFORM_TAG);
@@ -388,6 +767,27 @@ HalpRiscvFdtRequirements(_In_ ULONG Node, _In_ ULONG Bus, _Out_ PULONG_PTR Infor
         Resource->Flags = CM_RESOURCE_INTERRUPT_LEVEL_SENSITIVE;
         Resource->u.Interrupt.MinimumVector = Device.Interrupt[Index];
         Resource->u.Interrupt.MaximumVector = Device.Interrupt[Index];
+    }
+    for (Index = 0; Index < Device.GpioCount; ++Index, ++Resource)
+    {
+        Resource->Type = CmResourceTypeConnection;
+        Resource->ShareDisposition = CmResourceShareShared;
+        Resource->u.Connection.Class = CM_RESOURCE_CONNECTION_CLASS_GPIO;
+        Resource->u.Connection.Type = CM_RESOURCE_CONNECTION_TYPE_GPIO_IO;
+        Resource->u.Connection.IdLowPart = (ULONG)Device.GpioConnectionId[Index];
+        Resource->u.Connection.IdHighPart = (ULONG)(Device.GpioConnectionId[Index] >> 32);
+    }
+    if (HalpRiscvFdtSerialBusType(Bus))
+    {
+        UCHAR SerialBus = HalpRiscvFdtSerialBusType(Bus);
+        ULONG64 Id = HalpRiscvFdtGpioConnectionId(Node, SerialBus == CM_RESOURCE_CONNECTION_TYPE_SERIAL_UART ? "uart" : "i2c", 0);
+
+        Resource->Type = CmResourceTypeConnection;
+        Resource->ShareDisposition = CmResourceShareShared;
+        Resource->u.Connection.Class = CM_RESOURCE_CONNECTION_CLASS_SERIAL;
+        Resource->u.Connection.Type = SerialBus;
+        Resource->u.Connection.IdLowPart = (ULONG)Id;
+        Resource->u.Connection.IdHighPart = (ULONG)(Id >> 32);
     }
     *Information = (ULONG_PTR)List;
     return STATUS_SUCCESS;
@@ -688,6 +1088,13 @@ HalpRiscvFdtPnp(_In_ PDEVICE_OBJECT DeviceObject, _In_ PIO_STACK_LOCATION Stack,
 
         case IRP_MN_START_DEVICE:
             HalpRiscvFdtPublishProperties(DeviceObject, Extension->Node);
+            HalpRiscvFdtRegisterConnections(Extension->Node, Extension->Parent);
+            if (!Extension->Started)
+            {
+                Extension->Started = TRUE;
+                if (HalpRiscvPlatformBus && HalpRiscvFdtSerialBusType(Extension->Node))
+                    IoInvalidateDeviceRelations(HalpRiscvPlatformBus->Pdo, BusRelations);
+            }
             Status = STATUS_SUCCESS;
             break;
 
@@ -770,7 +1177,8 @@ HalpRiscvPlatformPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
             Stack->Parameters.QueryDeviceRelations.Type == BusRelations)
         {
             PDEVICE_RELATIONS Relations;
-
+            RISCV_PLATFORM_EXTENSION *ChildExtension;
+            PDEVICE_OBJECT Child;
             ULONG Index;
 
             Relations = ExAllocatePoolWithTag(PagedPool,
@@ -782,11 +1190,16 @@ HalpRiscvPlatformPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
                 Status = STATUS_INSUFFICIENT_RESOURCES;
                 goto Complete;
             }
-            Relations->Count = Extension->ChildCount;
+            Relations->Count = 0;
             for (Index = 0; Index < Extension->ChildCount; ++Index)
             {
-                Relations->Objects[Index] = Extension->Children[Index];
-                ObReferenceObject(Extension->Children[Index]);
+                Child = Extension->Children[Index];
+                ChildExtension = Child->DeviceExtension;
+                if (ChildExtension->Controller &&
+                    !((RISCV_PLATFORM_EXTENSION *)ChildExtension->Controller->DeviceExtension)->Started)
+                    continue;
+                Relations->Objects[Relations->Count++] = Child;
+                ObReferenceObject(Child);
             }
             Irp->IoStatus.Information = (ULONG_PTR)Relations;
             Status = STATUS_SUCCESS;
@@ -898,6 +1311,36 @@ HalpRiscvPlatformPower(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS NTAPI
+HalpRiscvPlatformDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+{
+    RISCV_PLATFORM_EXTENSION *Extension = DeviceObject->DeviceExtension;
+    PIO_STACK_LOCATION Stack = IoGetCurrentIrpStackLocation(Irp);
+    NTSTATUS Status;
+
+    if (Extension->Type == RISCV_PLATFORM_FDO)
+    {
+        IoSkipCurrentIrpStackLocation(Irp);
+        return IoCallDriver(Extension->LowerDevice, Irp);
+    }
+    switch (Stack->Parameters.DeviceIoControl.IoControlCode)
+    {
+        case IOCTL_ACPI_EVAL_METHOD:
+        case IOCTL_ACPI_ASYNC_EVAL_METHOD:
+        case IOCTL_ACPI_EVAL_METHOD_EX:
+        case IOCTL_ACPI_ASYNC_EVAL_METHOD_EX:
+            Status = STATUS_OBJECT_NAME_NOT_FOUND;
+            break;
+        default:
+            Status = STATUS_INVALID_DEVICE_REQUEST;
+            break;
+    }
+    Irp->IoStatus.Status = Status;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return Status;
+}
+
 static VOID
 HalpRiscvQueryDebuggerDevice(VOID)
 {
@@ -914,6 +1357,41 @@ HalpRiscvQueryDebuggerDevice(VOID)
     if (NT_SUCCESS(RtlQueryRegistryValues(RTL_REGISTRY_SERVICES, L"FDT\\Debug\\0",
                                           QueryTable, NULL, NULL)))
         HalpRiscvDebuggerBase = ((ULONG64)High << 32) | Low;
+}
+
+static VOID
+HalpRiscvFdtEnumerateSerialBus(_In_ PDRIVER_OBJECT DriverObject, _Inout_ RISCV_PLATFORM_EXTENSION *Extension,
+                               _In_ PDEVICE_OBJECT ControllerDevice)
+{
+    RISCV_PLATFORM_EXTENSION *ControllerExtension = ControllerDevice->DeviceExtension;
+    RISCV_PLATFORM_EXTENSION *ChildExtension;
+    ULONG Controller = ControllerExtension->Node;
+    RISCV_FDT_DEVICE Device;
+    PDEVICE_OBJECT Child;
+    ULONG Node, Length, Address;
+
+    for (Node = RiscvFdtFirstChild(&HalpRiscvPlatformFdt, Controller);
+         Node != RISCV_FDT_NO_NODE && Extension->ChildCount < RISCV_PLATFORM_MAX_CHILDREN;
+         Node = RiscvFdtNextSibling(&HalpRiscvPlatformFdt, Node))
+    {
+        if (!RiscvFdtGetProperty(&HalpRiscvPlatformFdt, Node, "compatible", &Length) ||
+            (HalpRiscvFdtIsI2cController(Controller) && !RiscvFdtReadU32(&HalpRiscvPlatformFdt, Node, "reg", &Address)) ||
+            !HalpRiscvFdtDescribe(Node, Controller, &Device))
+            continue;
+        if (!NT_SUCCESS(IoCreateDevice(DriverObject, sizeof(*Extension), NULL,
+                                       FILE_DEVICE_CONTROLLER, FILE_AUTOGENERATED_DEVICE_NAME,
+                                       FALSE, &Child)))
+            break;
+        ChildExtension = Child->DeviceExtension;
+        RtlZeroMemory(ChildExtension, sizeof(*ChildExtension));
+        ChildExtension->Type = RISCV_PLATFORM_FDT;
+        ChildExtension->Node = Node;
+        ChildExtension->Parent = Controller;
+        ChildExtension->Controller = ControllerDevice;
+        ChildExtension->Dma = ControllerExtension->Dma;
+        Extension->Children[Extension->ChildCount++] = Child;
+        Child->Flags &= ~DO_DEVICE_INITIALIZING;
+    }
 }
 
 static VOID
@@ -953,6 +1431,8 @@ HalpRiscvFdtEnumerate(_In_ PDRIVER_OBJECT DriverObject, _Inout_ RISCV_PLATFORM_E
         HalpRiscvFdtDmaTopology(Path, Depth + 1, &ChildExtension->Dma);
         Extension->Children[Extension->ChildCount++] = Child;
         Child->Flags &= ~DO_DEVICE_INITIALIZING;
+        if (HalpRiscvFdtSerialBusType(Node))
+            HalpRiscvFdtEnumerateSerialBus(DriverObject, Extension, Child);
     }
 }
 
@@ -976,6 +1456,7 @@ HalpRiscvPlatformAddDevice(_In_ PDRIVER_OBJECT DriverObject,
     Extension = Fdo->DeviceExtension;
     RtlZeroMemory(Extension, sizeof(*Extension));
     Extension->Type = RISCV_PLATFORM_FDO;
+    Extension->Pdo = PhysicalDeviceObject;
     Extension->FirstBus = FirstBus;
     Extension->LastBus = LastBus;
     Extension->LowerDevice = IoAttachDeviceToDeviceStack(Fdo, PhysicalDeviceObject);
@@ -1014,6 +1495,7 @@ HalpRiscvPlatformAddDevice(_In_ PDRIVER_OBJECT DriverObject,
         Path[1] = HalpRiscvPlatformSoc;
         HalpRiscvQueryDebuggerDevice();
         HalpRiscvFdtEnumerate(DriverObject, Extension, Path, 2);
+        HalpRiscvPlatformBus = Extension;
     }
     Fdo->Flags &= ~DO_DEVICE_INITIALIZING;
     return STATUS_SUCCESS;
@@ -1031,6 +1513,7 @@ HalpRiscvPlatformDriverEntry(_In_ PDRIVER_OBJECT DriverObject,
     DriverObject->DriverExtension->AddDevice = HalpRiscvPlatformAddDevice;
     DriverObject->MajorFunction[IRP_MJ_PNP] = HalpRiscvPlatformPnp;
     DriverObject->MajorFunction[IRP_MJ_POWER] = HalpRiscvPlatformPower;
+    DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = HalpRiscvPlatformDeviceControl;
 
     Status = IoReportDetectedDevice(DriverObject, InterfaceTypeUndefined,
                                     MAXULONG, MAXULONG, NULL, NULL,

@@ -52,10 +52,11 @@ public:
     }
 };
 
-class Native12Fence final : public Native12Child<ID3D12Fence>
+class Native12Fence final : public Native12Child<ID3D12Fence1>
 {
 public:
     D3DKMT_HANDLE sync = 0;
+    D3D12_FENCE_FLAGS flags = D3D12_FENCE_FLAG_NONE;
     const volatile UINT64 *value = NULL;
     D3D12DDI_HFENCE driver = {};
     bool driver_created = false;
@@ -67,6 +68,7 @@ public:
     UINT64 STDMETHODCALLTYPE GetCompletedValue() override;
     HRESULT STDMETHODCALLTYPE SetEventOnCompletion(UINT64 value, HANDLE event) override;
     HRESULT STDMETHODCALLTYPE Signal(UINT64 value) override;
+    D3D12_FENCE_FLAGS STDMETHODCALLTYPE GetCreationFlags() override;
 };
 
 class Native12CommandQueue final : public Native12Child<ID3D12CommandQueue>, public IWineDXGISwapChainFactory
@@ -83,6 +85,7 @@ public:
     Native12CommandQueue *next_queue = NULL;
     bool listed = false;
     SRWLOCK context_lock = SRWLOCK_INIT;
+    SRWLOCK submit_lock = SRWLOCK_INIT;
     HANDLE contexts[D3DDDI_MAX_BROADCAST_CONTEXT] = {};
     bool submitted[D3DDDI_MAX_BROADCAST_CONTEXT] = {};
     UINT context_count = 0;
@@ -281,6 +284,8 @@ public:
 
 HRESULT Native12CreateDefaultPipelineState(Native12Device *device, bool compute, ID3D12PipelineState **out);
 
+class Native12PipelineLibrary;
+
 class Native12PipelineState final : public Native12Child<ID3D12PipelineState>
 {
 public:
@@ -297,13 +302,70 @@ public:
     bool blend_created = false, rasterizer_created = false, depth_created = false, layout_created = false;
     bool compute = false;
     BOOL depth_bounds_test = FALSE;
+    D3D12_PIPELINE_STATE_FLAGS flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+    bool face_stencil_masks = false;
+    UINT8 back_stencil_read_mask = 0, back_stencil_write_mask = 0;
+    bool float_depth_bias = false;
+    FLOAT depth_bias = 0.0f;
+    bool line_mode_set = false;
+    D3D12_LINE_RASTERIZATION_MODE line_mode = D3D12_LINE_RASTERIZATION_MODE_ALIASED;
+    UINT view_instance_count = 0;
+    D3D12_VIEW_INSTANCE_LOCATION view_instance_locations[D3D12_MAX_VIEW_INSTANCE_COUNT] = {};
+    D3D12_VIEW_INSTANCING_FLAGS view_instancing_flags = D3D12_VIEW_INSTANCING_FLAG_NONE;
+    BYTE description_hash[16] = {};
+    BYTE expected_hash[16] = {};
+    bool check_hash = false;
+    bool hash_only = false;
+    Native12PipelineLibrary *library = NULL;
+    UINT library_index = 0;
 
     using Native12Child::Native12Child;
     ~Native12PipelineState();
     HRESULT InitializeGraphics(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *input);
     HRESULT InitializeCompute(const D3D12_COMPUTE_PIPELINE_STATE_DESC *input);
+    HRESULT PrepareDescription(const D3D12_GRAPHICS_PIPELINE_STATE_DESC *graphics,
+            const D3D12_COMPUTE_PIPELINE_STATE_DESC *compute, const D3D12_CACHED_PIPELINE_STATE &cached);
+    D3D12DDI_LIBRARY_REFERENCE_0010 LibraryReference() const;
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void **) override;
     HRESULT STDMETHODCALLTYPE GetCachedBlob(ID3DBlob **blob) override;
+};
+
+class Native12PipelineLibrary final : public Native12Child<ID3D12PipelineLibrary1>
+{
+public:
+    struct Entry
+    {
+        WCHAR *name;
+        BYTE hash[16];
+        Native12PipelineState *pipeline;
+    };
+    SRWLOCK lock = SRWLOCK_INIT;
+    Entry *entries = NULL;
+    UINT count = 0;
+    UINT capacity = 0;
+    D3D12DDI_HPIPELINELIBRARY driver = {};
+    bool driver_created = false;
+    BYTE *initial_data = NULL;
+
+    using Native12Child::Native12Child;
+    ~Native12PipelineLibrary();
+    HRESULT Initialize(const void *blob, SIZE_T size);
+    bool Find(const WCHAR *name, UINT *index) const;
+    HRESULT Store(const WCHAR *name, Native12PipelineState *pipeline);
+    SIZE_T SerializedSize();
+    HRESULT SerializeInto(BYTE *data, SIZE_T size);
+    template <typename Create> HRESULT Load(const WCHAR *name, REFIID iid, void **out, Create create);
+    ULONG STDMETHODCALLTYPE Release() override;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void **) override;
+    HRESULT STDMETHODCALLTYPE StorePipeline(LPCWSTR name, ID3D12PipelineState *pipeline) override;
+    HRESULT STDMETHODCALLTYPE LoadGraphicsPipeline(LPCWSTR name, const D3D12_GRAPHICS_PIPELINE_STATE_DESC *desc,
+            REFIID iid, void **out) override;
+    HRESULT STDMETHODCALLTYPE LoadComputePipeline(LPCWSTR name, const D3D12_COMPUTE_PIPELINE_STATE_DESC *desc,
+            REFIID iid, void **out) override;
+    SIZE_T STDMETHODCALLTYPE GetSerializedSize() override;
+    HRESULT STDMETHODCALLTYPE Serialize(void *data, SIZE_T size) override;
+    HRESULT STDMETHODCALLTYPE LoadPipeline(LPCWSTR name, const D3D12_PIPELINE_STATE_STREAM_DESC *desc, REFIID iid,
+            void **out) override;
 };
 
 struct Native12PassResolve
@@ -329,7 +391,7 @@ struct Native12RootArguments
     UINT constants[D3D12_MAX_ROOT_COST];
 };
 
-class Native12CommandList final : public Native12Child<ID3D12GraphicsCommandList4>
+class Native12CommandList final : public Native12Child<ID3D12GraphicsCommandList10>
 {
 public:
     Native12RootArguments root_arguments[2] = {};
@@ -350,7 +412,9 @@ public:
     Native12CommandAllocator *allocator = NULL;
     HRESULT error = S_OK;
     bool recording = false;
-    bool graphics_bound = false, compute_bound = false;
+    bool graphics_bound = false, compute_bound = false, pipeline_set = false;
+    D3D12_PIPELINE_STATE_FLAGS pipeline_flags = D3D12_PIPELINE_STATE_FLAG_NONE;
+    bool RejectInBundle();
     ID3D12PipelineState *default_states[2] = {};
     UINT64 id = 0;
 
@@ -482,6 +546,16 @@ public:
             D3D12_GPU_VIRTUAL_ADDRESS src_data, D3D12_RAYTRACING_ACCELERATION_STRUCTURE_COPY_MODE mode) override;
     void STDMETHODCALLTYPE SetPipelineState1(ID3D12StateObject *state_object) override;
     void STDMETHODCALLTYPE DispatchRays(const D3D12_DISPATCH_RAYS_DESC *desc) override;
+    void STDMETHODCALLTYPE RSSetShadingRate(D3D12_SHADING_RATE base_shading_rate,
+            const D3D12_SHADING_RATE_COMBINER *combiners) override;
+    void STDMETHODCALLTYPE RSSetShadingRateImage(ID3D12Resource *shading_rate_image) override;
+    void STDMETHODCALLTYPE DispatchMesh(UINT x, UINT y, UINT z) override;
+    void STDMETHODCALLTYPE Barrier(UINT32 group_count, const D3D12_BARRIER_GROUP *groups) override;
+    void STDMETHODCALLTYPE OMSetFrontAndBackStencilRef(UINT front, UINT back) override;
+    void STDMETHODCALLTYPE RSSetDepthBias(FLOAT bias, FLOAT clamp, FLOAT slope_scaled_bias) override;
+    void STDMETHODCALLTYPE IASetIndexBufferStripCutValue(D3D12_INDEX_BUFFER_STRIP_CUT_VALUE value) override;
+    void STDMETHODCALLTYPE SetProgram(const D3D12_SET_PROGRAM_DESC *desc) override;
+    void STDMETHODCALLTYPE DispatchGraph(const D3D12_DISPATCH_GRAPH_DESC *desc) override;
 };
 
 struct Native12FormatInfo

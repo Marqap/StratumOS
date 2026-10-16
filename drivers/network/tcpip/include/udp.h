@@ -62,4 +62,32 @@ NTSTATUS UDPShutdown(
 UINT UDPAllocatePort( UINT HintPort );
 VOID UDPFreePort( UINT Port );
 
+NTSTATUS LibIP6QueryTable(
+    ULONG TableId,
+    PVOID Buffer,
+    ULONG Length,
+    PULONG Count,
+    PULONG Needed,
+    PVOID Statistics);
+
+NTSTATUS LibICMP6EchoRequest(
+    PDEVICE_OBJECT DeviceObject,
+    PIRP Irp,
+    PIO_STACK_LOCATION IrpSp);
+
+NTSTATUS LibUDPOpen(
+    PADDRESS_FILE AddrFile,
+    USHORT Port,
+    PUSHORT AllocatedPort);
+
+VOID LibUDPClose(
+    PADDRESS_FILE AddrFile);
+
+NTSTATUS LibUDPSendDatagram(
+    PADDRESS_FILE AddrFile,
+    PTDI_CONNECTION_INFORMATION ConnInfo,
+    PCHAR BufferData,
+    ULONG DataSize,
+    PULONG DataUsed);
+
 /* EOF */

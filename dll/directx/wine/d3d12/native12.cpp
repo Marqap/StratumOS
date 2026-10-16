@@ -13,6 +13,22 @@ WINE_DEFAULT_DEBUG_CHANNEL(d3d12);
 
 static SRWLOCK Native12DeviceListLock = SRWLOCK_INIT;
 static Native12Device *Native12DeviceList;
+static SRWLOCK Native12SingletonLock = SRWLOCK_INIT;
+static Native12Device *Native12Singletons[16];
+
+static Native12Device *Native12FindSingleton(const LUID &luid, D3D_FEATURE_LEVEL minimum_level)
+{
+    for (Native12Device *device : Native12Singletons)
+    {
+        if (device && device->luid.LowPart == luid.LowPart && device->luid.HighPart == luid.HighPart
+                && device->feature_level >= minimum_level)
+        {
+            device->AddRef();
+            return device;
+        }
+    }
+    return NULL;
+}
 
 Native12PrivateData::~Native12PrivateData()
 {
@@ -537,6 +553,8 @@ HRESULT Native12Device::Initialize(IDXGIAdapter *selected_adapter, D3D_FEATURE_L
     HRESULT hr = selected_adapter->GetDesc(&desc);
     if (FAILED(hr)) return hr;
     luid = desc.AdapterLuid;
+    d3d12_dred_enablement(&dred_auto_breadcrumbs, &dred_page_fault);
+    configuration_flags = d3d12_device_configuration_flags();
 
     D3DKMT_OPENADAPTERFROMLUID open = {};
     open.AdapterLuid = desc.AdapterLuid;
@@ -719,14 +737,16 @@ HRESULT Native12Device::Initialize(IDXGIAdapter *selected_adapter, D3D_FEATURE_L
         WARN("The driver failed to fill the command queue table, hr %#lx.\n", hr);
         return hr;
     }
+    SIZE_T list_table_size = ddi_build >= D3D12DDI_BUILD_VERSION_0110 ? sizeof(list_functions)
+            : FIELD_OFFSET(NATIVE12_LIST_FUNCS, pfnSetProgram);
     table.handle = &list_functions;
     if (FAILED(hr = adapter_functions.pfnFillDDITable(driver_adapter, D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D,
-            &list_functions, ddi_build >= D3D12DDI_BUILD_VERSION_0110 ? sizeof(list_functions)
-                    : FIELD_OFFSET(NATIVE12_LIST_FUNCS, pfnSetProgram), 0, table)))
+            &list_functions, list_table_size, 0, table)))
     {
         WARN("The driver failed to fill the command list table, hr %#lx.\n", hr);
         return hr;
     }
+    if (FAILED(hr = FillListTables(list_table_size))) return hr;
 
     QueryCaps(D3D12DDICAPS_TYPE_D3D12_OPTIONS, NULL, &options, sizeof(options));
     QueryCaps(D3D12DDICAPS_TYPE_SHADER, NULL, &shader_caps, sizeof(shader_caps));
@@ -734,6 +754,10 @@ HRESULT Native12Device::Initialize(IDXGIAdapter *selected_adapter, D3D_FEATURE_L
     UINT node = 0;
     QueryCaps(D3D12DDICAPS_TYPE_MEMORY_ARCHITECTURE, &node, &memory, sizeof(memory));
     QueryCaps(D3D12DDICAPS_TYPE_GPUVA_CAPS, &node, &gpuva, sizeof(gpuva));
+    if (ddi_build >= D3D12DDI_BUILD_VERSION_0098)
+        QueryCaps(D3D12DDICAPS_TYPE_OPTIONS_0098, NULL, &gpu_upload, sizeof(gpu_upload));
+    TRACE("UMA %u, cache coherent %u, L1 fully CPU accessible %u.\n", memory.UMA, memory.CacheCoherent,
+            gpu_upload.L1MemoryFullyCpuAccessible);
 
     UINT model_count = 0;
     D3D12DDI_D3D12_SHADER_MODELS_DATA_0011 models = {};
@@ -761,6 +785,49 @@ HRESULT Native12Device::Initialize(IDXGIAdapter *selected_adapter, D3D_FEATURE_L
     return S_OK;
 }
 
+HRESULT Native12Device::FillListTables(SIZE_T list_table_size)
+{
+    D3D12DDI_TABLE_REQUEST *requests;
+    UINT32 count = 0, total = 2;
+    HRESULT hr = S_OK;
+
+    if (adapter_functions.pfnGetOptionalDDITables
+            && SUCCEEDED(adapter_functions.pfnGetOptionalDDITables(driver_adapter, &count, NULL)) && count)
+    {
+        if (!(requests = static_cast<D3D12DDI_TABLE_REQUEST *>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                count * sizeof(*requests)))))
+            return E_OUTOFMEMORY;
+        if (SUCCEEDED(adapter_functions.pfnGetOptionalDDITables(driver_adapter, &count, requests)))
+        {
+            for (UINT32 i = 0; i < count; ++i)
+                if (requests[i].tableType == D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D) total += requests[i].numTables;
+        }
+        HeapFree(GetProcessHeap(), 0, requests);
+    }
+
+    if (!(list_tables = static_cast<NATIVE12_LIST_FUNCS *>(HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+            (total - 1) * sizeof(*list_tables)))))
+        return E_OUTOFMEMORY;
+    list_table_count = total - 1;
+    for (UINT i = 0; i < list_table_count && SUCCEEDED(hr); ++i)
+    {
+        D3D12DDI_HRTTABLE table;
+        table.handle = &list_tables[i];
+        if (FAILED(hr = adapter_functions.pfnFillDDITable(driver_adapter, D3D12DDI_TABLE_TYPE_COMMAND_LIST_3D,
+                &list_tables[i], list_table_size, i + 1, table)))
+            WARN("The driver failed to fill command list table %u, hr %#lx.\n", i + 1, hr);
+    }
+    return hr;
+}
+
+const NATIVE12_LIST_FUNCS *Native12Device::FindListTable(HANDLE table)
+{
+    if (table == &list_functions) return &list_functions;
+    for (UINT i = 0; i < list_table_count; ++i)
+        if (table == &list_tables[i]) return &list_tables[i];
+    return NULL;
+}
+
 Native12Device::~Native12Device()
 {
     if (driver_created && adapter_functions.pfnDestroyDevice) adapter_functions.pfnDestroyDevice(driver_device);
@@ -786,6 +853,7 @@ Native12Device::~Native12Device()
     if (runtime_device && destroy_callbacks) destroy_callbacks(runtime_device);
     if (adapter_open && adapter_functions.pfnCloseAdapter) adapter_functions.pfnCloseAdapter(driver_adapter);
     if (driver_device_storage) HeapFree(GetProcessHeap(), 0, driver_device_storage);
+    if (list_tables) HeapFree(GetProcessHeap(), 0, list_tables);
     if (km_device)
     {
         D3DKMT_DESTROYDEVICE destroy = {};
@@ -809,9 +877,27 @@ HRESULT STDMETHODCALLTYPE Native12Device::QueryInterface(REFIID iid, void **out)
     if (IsEqualGUID(iid, IID_ID3D12Device) || IsEqualGUID(iid, IID_ID3D12Device1)
             || IsEqualGUID(iid, IID_ID3D12Device2) || IsEqualGUID(iid, IID_ID3D12Device3)
             || IsEqualGUID(iid, IID_ID3D12Device4) || IsEqualGUID(iid, IID_ID3D12Device5)
-            || IsEqualGUID(iid, IID_ID3D12Object) || IsEqualGUID(iid, IID_IUnknown))
+            || IsEqualGUID(iid, IID_ID3D12Device6) || IsEqualGUID(iid, IID_ID3D12Device7)
+            || IsEqualGUID(iid, IID_ID3D12Device8) || IsEqualGUID(iid, IID_ID3D12Device9)
+            || IsEqualGUID(iid, IID_ID3D12Device10) || IsEqualGUID(iid, IID_ID3D12Device11)
+            || IsEqualGUID(iid, IID_ID3D12Device12) || IsEqualGUID(iid, IID_ID3D12Device13)
+            || IsEqualGUID(iid, IID_ID3D12Device14) || IsEqualGUID(iid, IID_ID3D12Object)
+            || IsEqualGUID(iid, IID_IUnknown))
     {
-        *out = static_cast<ID3D12Device5 *>(this);
+        *out = static_cast<ID3D12Device14 *>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualGUID(iid, IID_ID3D12DeviceRemovedExtendedData) || IsEqualGUID(iid, IID_ID3D12DeviceRemovedExtendedData1)
+            || IsEqualGUID(iid, IID_ID3D12DeviceRemovedExtendedData2))
+    {
+        *out = static_cast<ID3D12DeviceRemovedExtendedData2 *>(this);
+        AddRef();
+        return S_OK;
+    }
+    if (IsEqualGUID(iid, IID_ID3D12DeviceConfiguration) || IsEqualGUID(iid, IID_ID3D12DeviceConfiguration1))
+    {
+        *out = static_cast<ID3D12DeviceConfiguration1 *>(this);
         AddRef();
         return S_OK;
     }
@@ -819,11 +905,79 @@ HRESULT STDMETHODCALLTYPE Native12Device::QueryInterface(REFIID iid, void **out)
     return E_NOINTERFACE;
 }
 
+HRESULT Native12Device::RefreshRemovedReason()
+{
+    if (SUCCEEDED(removed_reason) && km_device)
+    {
+        D3DKMT_GETDEVICESTATE state = {};
+        state.hDevice = km_device;
+        state.StateType = D3DKMT_DEVICESTATE_EXECUTION;
+        state.ExecutionState = D3DKMT_DEVICEEXECUTION_ACTIVE;
+        D3DKMTGetDeviceState(&state);
+        if (state.ExecutionState != D3DKMT_DEVICEEXECUTION_ACTIVE)
+            InterlockedCompareExchange(reinterpret_cast<LONG *>(&removed_reason), DXGI_ERROR_DEVICE_REMOVED, S_OK);
+    }
+    return removed_reason;
+}
+
+HRESULT Native12Device::DredStatus(D3D12_DRED_ENABLEMENT enablement)
+{
+    if (enablement != D3D12_DRED_ENABLEMENT_FORCED_ON) return DXGI_ERROR_UNSUPPORTED;
+    return SUCCEEDED(RefreshRemovedReason()) ? DXGI_ERROR_NOT_CURRENTLY_AVAILABLE : S_OK;
+}
+
+HRESULT STDMETHODCALLTYPE Native12Device::GetAutoBreadcrumbsOutput(D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT *output)
+{
+    HRESULT hr = DredStatus(dred_auto_breadcrumbs);
+    if (SUCCEEDED(hr)) output->pHeadAutoBreadcrumbNode = NULL;
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Native12Device::GetPageFaultAllocationOutput(D3D12_DRED_PAGE_FAULT_OUTPUT *output)
+{
+    HRESULT hr = DredStatus(dred_page_fault);
+    if (SUCCEEDED(hr)) ZeroMemory(output, sizeof(*output));
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Native12Device::GetAutoBreadcrumbsOutput1(D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 *output)
+{
+    HRESULT hr = DredStatus(dred_auto_breadcrumbs);
+    if (SUCCEEDED(hr)) output->pHeadAutoBreadcrumbNode = NULL;
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Native12Device::GetPageFaultAllocationOutput1(D3D12_DRED_PAGE_FAULT_OUTPUT1 *output)
+{
+    HRESULT hr = DredStatus(dred_page_fault);
+    if (SUCCEEDED(hr)) ZeroMemory(output, sizeof(*output));
+    return hr;
+}
+
+HRESULT STDMETHODCALLTYPE Native12Device::GetPageFaultAllocationOutput2(D3D12_DRED_PAGE_FAULT_OUTPUT2 *output)
+{
+    HRESULT hr = DredStatus(dred_page_fault);
+    if (SUCCEEDED(hr)) ZeroMemory(output, sizeof(*output));
+    return hr;
+}
+
+D3D12_DRED_DEVICE_STATE STDMETHODCALLTYPE Native12Device::GetDeviceState()
+{
+    return D3D12_DRED_DEVICE_STATE_UNKNOWN;
+}
+
 ULONG STDMETHODCALLTYPE Native12Device::AddRef() { return InterlockedIncrement(&references); }
 
 ULONG STDMETHODCALLTYPE Native12Device::Release()
 {
+    AcquireSRWLockExclusive(&Native12SingletonLock);
     ULONG count = InterlockedDecrement(&references);
+    if (!count)
+    {
+        for (Native12Device *&entry : Native12Singletons)
+            if (entry == this) entry = NULL;
+    }
+    ReleaseSRWLockExclusive(&Native12SingletonLock);
     if (!count) delete this;
     return count;
 }
@@ -1023,6 +1177,7 @@ HRESULT STDMETHODCALLTYPE Native12Device::CheckFeatureSupport(D3D12_FEATURE feat
             ZeroMemory(caps, sizeof(*caps));
             caps->CopyQueueTimestampQueriesSupported = !!options.CopyQueueTimestampQueriesSupported;
             caps->BarycentricsSupported = !!options.BarycentricsSupported;
+            caps->ViewInstancingTier = static_cast<D3D12_VIEW_INSTANCING_TIER>(options.ViewInstancingTier);
             if (options.WriteBufferImmediateQueueFlags & D3D12DDI_COMMAND_QUEUE_FLAG_3D)
                 caps->WriteBufferImmediateSupportFlags |= D3D12_COMMAND_LIST_SUPPORT_FLAG_DIRECT;
             if (options.WriteBufferImmediateQueueFlags & D3D12DDI_COMMAND_QUEUE_FLAG_COMPUTE)
@@ -1054,6 +1209,11 @@ HRESULT STDMETHODCALLTYPE Native12Device::CheckFeatureSupport(D3D12_FEATURE feat
             D3D12_FEATURE_DATA_D3D12_OPTIONS6 *caps;
             if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
             ZeroMemory(caps, sizeof(*caps));
+            if (options.VariableShadingRateTier != D3D12DDI_VARIABLE_SHADING_RATE_TIER_NOT_SUPPORTED)
+            {
+                caps->VariableShadingRateTier = D3D12_VARIABLE_SHADING_RATE_TIER_1;
+                caps->AdditionalShadingRatesSupported = !!options.AdditionalShadingRatesSupported;
+            }
             return S_OK;
         }
         case D3D12_FEATURE_D3D12_OPTIONS7:
@@ -1090,7 +1250,10 @@ HRESULT STDMETHODCALLTYPE Native12Device::CheckFeatureSupport(D3D12_FEATURE feat
         {
             D3D12_FEATURE_DATA_SHADER_CACHE *caps;
             if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
-            caps->SupportFlags = D3D12_SHADER_CACHE_SUPPORT_NONE;
+            caps->SupportFlags = D3D12_SHADER_CACHE_SUPPORT_SINGLE_PSO;
+            if (functions.pfnCreatePipelineLibrary && functions.pfnAddPipelineStateToLibrary
+                    && functions.pfnSerializeLibrary)
+                caps->SupportFlags |= D3D12_SHADER_CACHE_SUPPORT_LIBRARY;
             return S_OK;
         }
         case D3D12_FEATURE_COMMAND_QUEUE_PRIORITY:
@@ -1105,8 +1268,7 @@ HRESULT STDMETHODCALLTYPE Native12Device::CheckFeatureSupport(D3D12_FEATURE feat
         {
             D3D12_FEATURE_DATA_ROOT_SIGNATURE *caps;
             if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
-            if (caps->HighestVersion > D3D_ROOT_SIGNATURE_VERSION_1_1)
-                caps->HighestVersion = D3D_ROOT_SIGNATURE_VERSION_1_1;
+            if (caps->HighestVersion > D3D_ROOT_SIGNATURE_VERSION_1_2) return E_INVALIDARG;
             return S_OK;
         }
         case D3D12_FEATURE_PROTECTED_RESOURCE_SESSION_SUPPORT:
@@ -1184,8 +1346,19 @@ HRESULT STDMETHODCALLTYPE Native12Device::CheckFeatureSupport(D3D12_FEATURE feat
         case D3D12_FEATURE_D3D12_OPTIONS13:
         {
             D3D12_FEATURE_DATA_D3D12_OPTIONS13 *caps;
+            D3D12DDI_OPTIONS_DATA_0091 relaxed = {};
             if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
             ZeroMemory(caps, sizeof(*caps));
+            if (ddi_build >= D3D12DDI_BUILD_VERSION_0091
+                    && SUCCEEDED(QueryCaps(D3D12DDICAPS_TYPE_OPTIONS_0091, NULL, &relaxed, sizeof(relaxed))))
+            {
+                caps->UnrestrictedBufferTextureCopyPitchSupported = !!relaxed.UnrestrictedBufferTextureCopyPitchSupported;
+                caps->UnrestrictedVertexElementAlignmentSupported = !!relaxed.UnrestrictedVertexElementAlignmentSupported;
+                caps->InvertedViewportHeightFlipsYSupported = !!relaxed.InvertedViewportHeightFlipsYSupported;
+                caps->InvertedViewportDepthFlipsZSupported = !!relaxed.InvertedViewportDepthFlipsZSupported;
+            }
+            caps->TextureCopyBetweenDimensionsSupported = ddi_build >= D3D12DDI_BUILD_VERSION_0091;
+            caps->AlphaBlendFactorSupported = ddi_build >= D3D12DDI_BUILD_VERSION_0092;
             return S_OK;
         }
         case D3D12_FEATURE_D3D12_OPTIONS14:
@@ -1200,6 +1373,7 @@ HRESULT STDMETHODCALLTYPE Native12Device::CheckFeatureSupport(D3D12_FEATURE feat
                 caps->AdvancedTextureOpsSupported = !!texture_ops.AdvancedTextureOpsSupported;
                 caps->WriteableMSAATexturesSupported = !!texture_ops.WriteableMSAATexturesSupported;
             }
+            caps->IndependentFrontAndBackStencilRefMaskSupported = ddi_build >= D3D12DDI_BUILD_VERSION_0095;
             return S_OK;
         }
         case D3D12_FEATURE_D3D12_OPTIONS15:
@@ -1207,6 +1381,8 @@ HRESULT STDMETHODCALLTYPE Native12Device::CheckFeatureSupport(D3D12_FEATURE feat
             D3D12_FEATURE_DATA_D3D12_OPTIONS15 *caps;
             if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
             ZeroMemory(caps, sizeof(*caps));
+            caps->TriangleFanSupported = ddi_build >= D3D12DDI_BUILD_VERSION_0097;
+            caps->DynamicIndexBufferStripCutSupported = ddi_build >= D3D12DDI_BUILD_VERSION_0099;
             return S_OK;
         }
         case D3D12_FEATURE_D3D12_OPTIONS16:
@@ -1214,6 +1390,8 @@ HRESULT STDMETHODCALLTYPE Native12Device::CheckFeatureSupport(D3D12_FEATURE feat
             D3D12_FEATURE_DATA_D3D12_OPTIONS16 *caps;
             if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
             ZeroMemory(caps, sizeof(*caps));
+            caps->DynamicDepthBiasSupported = ddi_build >= D3D12DDI_BUILD_VERSION_0099;
+            caps->GPUUploadHeapSupported = !!gpu_upload.L1MemoryFullyCpuAccessible;
             return S_OK;
         }
         case D3D12_FEATURE_D3D12_OPTIONS17:
@@ -1227,8 +1405,73 @@ HRESULT STDMETHODCALLTYPE Native12Device::CheckFeatureSupport(D3D12_FEATURE feat
         {
             D3D12_FEATURE_DATA_D3D12_OPTIONS18 *caps;
             if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
-            caps->RenderPassesValid = FALSE;
+            caps->RenderPassesValid = TRUE;
             return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS19:
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS19 *caps;
+            D3D12DDI_OPTIONS_DATA_0101 compute = {};
+            D3D12DDI_OPTIONS_DATA_0102 limits = {};
+            if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
+            ZeroMemory(caps, sizeof(*caps));
+            caps->RasterizerDesc2Supported = TRUE;
+            caps->NarrowQuadrilateralLinesSupported = ddi_build >= D3D12DDI_BUILD_VERSION_0102;
+            caps->AnisoFilterWithPointMipSupported = ddi_build >= D3D12DDI_BUILD_VERSION_0102;
+            caps->SupportedSampleCountsWithNoOutputs = 1;
+            caps->MaxSamplerDescriptorHeapSize = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+            caps->MaxSamplerDescriptorHeapSizeWithStaticSamplers = D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
+            caps->MaxViewDescriptorHeapSize = D3D12_MAX_SHADER_VISIBLE_DESCRIPTOR_HEAP_SIZE_TIER_2;
+            if (ddi_build >= D3D12DDI_BUILD_VERSION_0102
+                    && SUCCEEDED(QueryCaps(D3D12DDICAPS_TYPE_OPTIONS_0102, NULL, &limits, sizeof(limits))))
+            {
+                caps->MismatchingOutputDimensionsSupported = TRUE;
+                caps->PointSamplingAddressesNeverRoundUp = TRUE;
+                caps->SupportedSampleCountsWithNoOutputs = limits.SupportedSampleCountsWithNoOutputs;
+                caps->MaxSamplerDescriptorHeapSize = limits.MaxSamplerDescriptorHeapSize;
+                caps->MaxSamplerDescriptorHeapSizeWithStaticSamplers = limits.MaxSamplerDescriptorHeapSizeWithStaticSamplers;
+                caps->MaxViewDescriptorHeapSize = limits.MaxViewDescriptorHeapSize;
+            }
+            if (ddi_build >= D3D12DDI_BUILD_VERSION_0101
+                    && SUCCEEDED(QueryCaps(D3D12DDICAPS_TYPE_OPTIONS_0101, NULL, &compute, sizeof(compute))))
+                caps->ComputeOnlyCustomHeapSupported = !!compute.ComputeOnlyCustomHeapSupported;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS20:
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS20 *caps;
+            if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
+            caps->ComputeOnlyWriteWatchSupported = FALSE;
+            caps->RecreateAtTier = D3D12_RECREATE_AT_TIER_NOT_SUPPORTED;
+            return S_OK;
+        }
+        case D3D12_FEATURE_D3D12_OPTIONS21:
+        {
+            D3D12_FEATURE_DATA_D3D12_OPTIONS21 *caps;
+            if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
+            caps->WorkGraphsTier = D3D12_WORK_GRAPHS_TIER_NOT_SUPPORTED;
+            caps->ExecuteIndirectTier = D3D12_EXECUTE_INDIRECT_TIER_1_0;
+            caps->SampleCmpGradientAndBiasSupported = FALSE;
+            caps->ExtendedCommandInfoSupported = FALSE;
+            return S_OK;
+        }
+        case D3D12_FEATURE_PREDICATION:
+        {
+            D3D12_FEATURE_DATA_PREDICATION *caps;
+            if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
+            return E_UNEXPECTED;
+        }
+        case D3D12_FEATURE_PLACED_RESOURCE_SUPPORT_INFO:
+        {
+            D3D12_FEATURE_DATA_PLACED_RESOURCE_SUPPORT_INFO *caps;
+            if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
+            return E_UNEXPECTED;
+        }
+        case D3D12_FEATURE_HARDWARE_COPY:
+        {
+            D3D12_FEATURE_DATA_HARDWARE_COPY *caps;
+            if (!Native12FeatureData(data, size, &caps)) return E_INVALIDARG;
+            return E_UNEXPECTED;
         }
         default:
             WARN("Unknown feature %#x.\n", feature);
@@ -1242,7 +1485,7 @@ LUID *STDMETHODCALLTYPE Native12Device::GetAdapterLuid(LUID *out)
     return out;
 }
 
-HRESULT STDMETHODCALLTYPE Native12Device::GetDeviceRemovedReason() { return removed_reason; }
+HRESULT STDMETHODCALLTYPE Native12Device::GetDeviceRemovedReason() { return RefreshRemovedReason(); }
 
 HRESULT Native12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_level, REFIID iid, void **out)
 {
@@ -1264,13 +1507,48 @@ HRESULT Native12CreateDevice(IUnknown *adapter, D3D_FEATURE_LEVEL minimum_level,
         if (FAILED(hr)) return hr;
     }
 
-    Native12Device *device = new Native12Device();
-    if (!device)
+    DXGI_ADAPTER_DESC adapter_desc;
+    if (FAILED(hr = selected->GetDesc(&adapter_desc)))
     {
         selected->Release();
-        return E_OUTOFMEMORY;
+        return hr;
     }
-    hr = device->Initialize(selected, minimum_level);
+    AcquireSRWLockExclusive(&Native12SingletonLock);
+    Native12Device *device = Native12FindSingleton(adapter_desc.AdapterLuid, minimum_level);
+    ReleaseSRWLockExclusive(&Native12SingletonLock);
+    if (device) hr = S_OK;
+    else
+    {
+        device = new Native12Device();
+        if (!device)
+        {
+            selected->Release();
+            return E_OUTOFMEMORY;
+        }
+        hr = device->Initialize(selected, minimum_level);
+        if (SUCCEEDED(hr))
+        {
+            Native12Device *existing;
+            AcquireSRWLockExclusive(&Native12SingletonLock);
+            if (!(existing = Native12FindSingleton(adapter_desc.AdapterLuid, minimum_level)))
+            {
+                for (Native12Device *&entry : Native12Singletons)
+                {
+                    if (!entry)
+                    {
+                        entry = device;
+                        break;
+                    }
+                }
+            }
+            ReleaseSRWLockExclusive(&Native12SingletonLock);
+            if (existing)
+            {
+                device->Release();
+                device = existing;
+            }
+        }
+    }
     selected->Release();
     if (SUCCEEDED(hr))
     {

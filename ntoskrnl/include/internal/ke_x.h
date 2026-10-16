@@ -473,43 +473,28 @@ FORCEINLINE
 VOID
 KiAcquireDispatcherObject(IN DISPATCHER_HEADER* Object)
 {
-    LONG OldValue;
-
     /* Make sure we're at a safe level to touch the lock */
     ASSERT(KeGetCurrentIrql() >= DISPATCH_LEVEL);
 
     /* Start acquire loop */
-    do
+    while (InterlockedOr(&Object->Lock, KOBJECT_LOCK_BIT) & KOBJECT_LOCK_BIT)
     {
         /* Loop until the other CPU releases it */
-        while (TRUE)
+        do
         {
-            /* Check if it got released */
-            OldValue = Object->Lock;
-            if ((OldValue & KOBJECT_LOCK_BIT) == 0) break;
-
             /* Let the CPU know that this is a loop */
             YieldProcessor();
-        }
-
-        /* Try acquiring the lock now */
-    } while (InterlockedCompareExchange(&Object->Lock,
-                                        OldValue | KOBJECT_LOCK_BIT,
-                                        OldValue) != OldValue);
+        } while (Object->Lock & KOBJECT_LOCK_BIT);
+    }
 }
 
 FORCEINLINE
 BOOLEAN
 KiTryAcquireDispatcherObject(IN DISPATCHER_HEADER* Object)
 {
-    LONG OldValue;
-
     ASSERT(KeGetCurrentIrql() >= DISPATCH_LEVEL);
 
-    OldValue = Object->Lock;
-    if (OldValue & KOBJECT_LOCK_BIT) return FALSE;
-
-    return (InterlockedCompareExchange(&Object->Lock, OldValue | KOBJECT_LOCK_BIT, OldValue) == OldValue);
+    return !(InterlockedOr(&Object->Lock, KOBJECT_LOCK_BIT) & KOBJECT_LOCK_BIT);
 }
 
 FORCEINLINE
@@ -632,7 +617,7 @@ FORCEINLINE
 VOID
 KiSetThreadSwapBusy(IN PKTHREAD Thread)
 {
-#if (NTDDI_VERSION < NTDDI_WIN7) || defined(_M_ARM64)
+#if (NTDDI_VERSION < NTDDI_WIN7)
     /* Make sure nobody already set it */
     ASSERT(Thread->SwapBusy == FALSE);
 
@@ -818,14 +803,9 @@ FORCEINLINE
 VOID
 KiClearThreadSwapBusy(IN PKTHREAD Thread)
 {
-#if defined(CONFIG_SMP) && \
-    ((NTDDI_VERSION < NTDDI_WIN7) || defined(_M_ARM64))
+#if defined(CONFIG_SMP) && (NTDDI_VERSION < NTDDI_WIN7)
     KeMemoryBarrier();
     Thread->SwapBusy = FALSE;
-#ifdef _M_ARM64
-    __asm__ __volatile__("dmb ishst" ::: "memory");
-    __asm__ __volatile__("sev" ::: "memory");
-#endif
 #else
     UNREFERENCED_PARAMETER(Thread);
 #endif
@@ -1020,7 +1000,7 @@ KiRecalculateDueTime(IN PLARGE_INTEGER OriginalDueTime,
     if (OriginalDueTime->QuadPart >= 0) return OriginalDueTime;
 
     /* Otherwise, query the interrupt time and recalculate */
-    NewDueTime->QuadPart = KeQueryInterruptTime();
+    NewDueTime->QuadPart = KiQueryInterruptTimePrecise(NULL, FALSE);
     NewDueTime->QuadPart -= DueTime->QuadPart;
     return NewDueTime;
 }
@@ -1239,7 +1219,7 @@ KiComputeDueTime(IN PKTIMER Timer,
     if (DueTime.HighPart >= 0)
     {
         /* Get System Time */
-        KeQuerySystemTime(&SystemTime);
+        KeQuerySystemTimePrecise(&SystemTime);
 
         /* Do the conversion */
         DifferenceTime.QuadPart = SystemTime.QuadPart - DueTime.QuadPart;
@@ -1261,7 +1241,7 @@ KiComputeDueTime(IN PKTIMER Timer,
     }
 
     /* Get the Interrupt Time */
-    InterruptTime.QuadPart = KeQueryInterruptTime();
+    InterruptTime.QuadPart = KiQueryInterruptTimePrecise(NULL, FALSE);
 
     /* Recalculate due time */
     Timer->DueTime.QuadPart = InterruptTime.QuadPart - DueTime.QuadPart;
@@ -1320,9 +1300,25 @@ KxRemoveTreeTimer(IN PKTIMER Timer)
 }
 
 FORCEINLINE
+ULONGLONG
+KiRoundToDefaultTimerResolution(IN ULONGLONG DueTime)
+{
+    ULONGLONG Phase = KiTickPhase;
+    ULONGLONG Tick;
+
+    if (DueTime <= Phase)
+        return DueTime;
+
+    Tick = (DueTime - Phase + KeMaximumIncrement - 1) / KeMaximumIncrement;
+    Tick = Tick * KeMaximumIncrement + Phase - KeTimeIncrement / 16;
+    return max(DueTime, Tick);
+}
+
+FORCEINLINE
 VOID
 KxSetTimerForThreadWait(IN PKTIMER Timer,
                         IN LARGE_INTEGER Interval,
+                        IN KPROCESSOR_MODE WaitMode,
                         OUT PULONG Hand)
 {
     ULONGLONG DueTime;
@@ -1333,7 +1329,7 @@ KxSetTimerForThreadWait(IN PKTIMER Timer,
     if (Interval.HighPart >= 0)
     {
         /* Get the system time and calculate the relative time */
-        KeQuerySystemTime(&SystemTime);
+        KeQuerySystemTimePrecise(&SystemTime);
         TimeDifference.QuadPart = SystemTime.QuadPart - Interval.QuadPart;
         Timer->Header.Absolute = TRUE;
 
@@ -1354,8 +1350,13 @@ KxSetTimerForThreadWait(IN PKTIMER Timer,
     }
 
     /* Calculate the due time */
-    InterruptTime.QuadPart = KeQueryInterruptTime();
+    InterruptTime.QuadPart = KiQueryInterruptTimePrecise(NULL, FALSE);
     DueTime = InterruptTime.QuadPart - Interval.QuadPart;
+    if ((WaitMode == UserMode) &&
+        !((PEPROCESS)KeGetCurrentThread()->ApcState.Process)->SetTimerResolution)
+    {
+        DueTime = KiRoundToDefaultTimerResolution(DueTime);
+    }
     Timer->DueTime.QuadPart = DueTime;
 
     /* Calculate the timer handle */
@@ -1536,7 +1537,7 @@ KxCommitThreadWait(IN PKTHREAD Thread,
     Thread->WaitBlockList = TimerBlock;                                     \
                                                                             \
     /* Setup the timer */                                                   \
-    KxSetTimerForThreadWait(Timer, *Interval, &Hand);                       \
+    KxSetTimerForThreadWait(Timer, *Interval, WaitMode, &Hand);             \
                                                                             \
     /* Save the due time for the caller */                                  \
     DueTime.QuadPart = Timer->DueTime.QuadPart;                             \
@@ -1595,7 +1596,7 @@ KxCommitThreadWait(IN PKTHREAD Thread,
         KxChainTimerToArray(WaitBlockArray);                                \
                                                                             \
         /* Setup the timer */                                               \
-        KxSetTimerForThreadWait(Timer, *Timeout, &Hand);                    \
+        KxSetTimerForThreadWait(Timer, *Timeout, WaitMode, &Hand);          \
                                                                             \
         /* Save the due time for the caller */                              \
         DueTime.QuadPart = Timer->DueTime.QuadPart;                         \
@@ -1631,7 +1632,7 @@ KxCommitThreadWait(IN PKTHREAD Thread,
     if (Timeout)                                                            \
     {                                                                       \
         /* Setup the timer */                                               \
-        KxSetTimerForThreadWait(Timer, *Timeout, &Hand);                    \
+        KxSetTimerForThreadWait(Timer, *Timeout, WaitMode, &Hand);          \
                                                                             \
         /* Save the due time for the caller */                              \
         DueTime.QuadPart = Timer->DueTime.QuadPart;                         \
@@ -1676,7 +1677,7 @@ KxCommitThreadWait(IN PKTHREAD Thread,
     if (Timeout)                                                            \
     {                                                                       \
         /* Setup the timer */                                               \
-        KxSetTimerForThreadWait(Timer, *Timeout, &Hand);                    \
+        KxSetTimerForThreadWait(Timer, *Timeout, WaitMode, &Hand);          \
                                                                             \
         /* Save the due time for the caller */                              \
         DueTime.QuadPart = Timer->DueTime.QuadPart;                         \
@@ -1827,8 +1828,7 @@ FORCEINLINE
 VOID
 KiWaitForThreadSwapOut(IN PKTHREAD Thread)
 {
-#if defined(_M_ARM64) || \
-    (defined(_M_AMD64) && (NTDDI_VERSION < NTDDI_WIN7))
+#if defined(_M_AMD64) && (NTDDI_VERSION < NTDDI_WIN7)
     while (*(volatile BOOLEAN *)&Thread->SwapBusy)
     {
         YieldProcessor();

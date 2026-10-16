@@ -6,6 +6,7 @@
  */
 
 #include "nwifi.h"
+#include <dot11wificxintf.h>
 
 #define NDEBUG
 #include <debug.h>
@@ -56,6 +57,13 @@ NwifiProtocolDoRequest(
         Request->DATA.SET_INFORMATION.InformationBuffer = Buffer;
         Request->DATA.SET_INFORMATION.InformationBufferLength = Length;
     }
+    else if (RequestType == NdisRequestMethod)
+    {
+        Request->DATA.METHOD_INFORMATION.Oid = Oid;
+        Request->DATA.METHOD_INFORMATION.InformationBuffer = Buffer;
+        Request->DATA.METHOD_INFORMATION.InputBufferLength = Length;
+        Request->DATA.METHOD_INFORMATION.OutputBufferLength = Length;
+    }
     else
     {
         Request->DATA.QUERY_INFORMATION.Oid = Oid;
@@ -80,7 +88,12 @@ NwifiProtocolDoRequest(
 
     if (BytesProcessed != NULL)
     {
-        *BytesProcessed = (RequestType == NdisRequestSetInformation) ? Request->DATA.SET_INFORMATION.BytesRead : Request->DATA.QUERY_INFORMATION.BytesWritten;
+        if (RequestType == NdisRequestSetInformation)
+            *BytesProcessed = Request->DATA.SET_INFORMATION.BytesRead;
+        else if (RequestType == NdisRequestMethod)
+            *BytesProcessed = Request->DATA.METHOD_INFORMATION.BytesWritten;
+        else
+            *BytesProcessed = Request->DATA.QUERY_INFORMATION.BytesWritten;
     }
 
     return Status;
@@ -248,6 +261,29 @@ NwifiOpenLowerAdapter(
     return Status;
 }
 
+static
+VOID
+NwifiGuidFromDeviceName(
+    _In_ PCUNICODE_STRING DeviceName,
+    _Out_ GUID *Guid)
+{
+    UNICODE_STRING GuidString;
+    USHORT Start;
+
+    RtlZeroMemory(Guid, sizeof(*Guid));
+    for (Start = 0; Start < DeviceName->Length / sizeof(WCHAR); Start++)
+    {
+        if (DeviceName->Buffer[Start] == L'{')
+            break;
+    }
+
+    GuidString.Buffer = DeviceName->Buffer + Start;
+    GuidString.Length = DeviceName->Length - Start * sizeof(WCHAR);
+    GuidString.MaximumLength = GuidString.Length;
+    if (GuidString.Length != 38 * sizeof(WCHAR) || !NT_SUCCESS(RtlGUIDFromString(&GuidString, Guid)))
+        RtlZeroMemory(Guid, sizeof(*Guid));
+}
+
 /* ===========================================================================
  *  BindAdapterEx
  * ===========================================================================
@@ -304,6 +340,7 @@ NwifiBindAdapterEx(
         Adapter->LowerDeviceNameStore.Length = (USHORT)NameBytes;
         Adapter->LowerDeviceNameStore.MaximumLength = (USHORT)(NameBytes + sizeof(WCHAR));
         Adapter->LowerDeviceName = &Adapter->LowerDeviceNameStore;
+        NwifiGuidFromDeviceName(Adapter->LowerDeviceName, &Adapter->AdapterGuid);
     }
 
     Status = NwifiCreateNblPools(Adapter);
@@ -358,14 +395,14 @@ NwifiBindAdapterEx(
      * callback on arbitrary lower-driver work. */
     {
         ULONG Dot11PacketFilter =
-            DOT11_PACKET_TYPE_DIRECTED_DATA |
-            DOT11_PACKET_TYPE_MULTICAST_DATA |
-            DOT11_PACKET_TYPE_ALL_MULTICAST_DATA |
-            DOT11_PACKET_TYPE_BROADCAST_DATA;
+            NDIS_PACKET_TYPE_802_11_DIRECTED_DATA |
+            NDIS_PACKET_TYPE_802_11_MULTICAST_DATA |
+            NDIS_PACKET_TYPE_802_11_ALL_MULTICAST_DATA |
+            NDIS_PACKET_TYPE_802_11_BROADCAST_DATA;
         ULONG BytesRead = 0;
 
         Status = NwifiProtocolDoRequest(Adapter, NdisRequestSetInformation,
-                                        OID_DOT11_CURRENT_PACKET_FILTER,
+                                        OID_GEN_CURRENT_PACKET_FILTER,
                                         &Dot11PacketFilter,
                                         sizeof(Dot11PacketFilter),
                                         &BytesRead);
@@ -395,15 +432,19 @@ NwifiBindAdapterEx(
      * NwifiMiniportInitializeEx, which recovers this NWIFI_ADAPTER via
      * NdisIMGetDeviceContext. */
     {
-        /*
-         * The upper miniport needs a device name distinct from the lower
-         * adapter's FDO.  A fixed GUID name lets the registry pre-bind tcpip
-         * to it (one instance; another dot11 NIC would need a distinct GUID).
-         */
-        static const WCHAR NwifiUpperName[] =
-            L"\\Device\\{B1D2C3E4-5F6A-4B8C-9D0E-02524F535731}";
+        static const WCHAR Hex[] = L"0123456789ABCDEF";
+        WCHAR UpperNameBuffer[] = L"\\Device\\{B1D2C3E4-5F6A-4B8C-9D0E-000000000000}";
         NDIS_STRING UpperName;
-        RtlInitUnicodeString(&UpperName, NwifiUpperName);
+        ULONG Digit = RTL_NUMBER_OF(UpperNameBuffer) - 1 - 1 - 2 * IEEE80211_ADDR_LEN;
+        ULONG i;
+
+        for (i = 0; i < IEEE80211_ADDR_LEN; i++)
+        {
+            UpperNameBuffer[Digit++] = Hex[Adapter->MacAddress[i] >> 4];
+            UpperNameBuffer[Digit++] = Hex[Adapter->MacAddress[i] & 0xF];
+        }
+        RtlInitUnicodeString(&UpperName, UpperNameBuffer);
+        NwifiGuidFromDeviceName(&UpperName, &Adapter->InterfaceGuid);
         Status = NdisIMInitializeDeviceInstanceEx(gNwifi.MiniportDriverHandle,
                                                   &UpperName,
                                                   (NDIS_HANDLE)Adapter);
@@ -672,6 +713,15 @@ NwifiProtocolStatusEx(
 
         case NDIS_STATUS_DOT11_PHY_STATE_CHANGED:
             DPRINT("NWIFI: dot11 PHY state changed\n");
+            break;
+
+        case NDIS_STATUS_WDI_INDICATION_SAE_AUTH_PARAMS_NEEDED:
+            if (Adapter->MsmContext != NULL && StatusIndication->StatusBuffer != NULL)
+            {
+                NwifiSupplicantQueueSaeIndication((PNWIFI_MSM)Adapter->MsmContext,
+                                                  StatusIndication->StatusBuffer,
+                                                  StatusIndication->StatusBufferSize);
+            }
             break;
 
         default:

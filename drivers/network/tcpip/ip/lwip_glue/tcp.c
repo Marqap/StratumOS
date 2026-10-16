@@ -32,14 +32,11 @@ void
 LibTCPDumpPcb(PVOID SocketContext)
 {
     struct tcp_pcb *pcb = (struct tcp_pcb*)SocketContext;
-    unsigned int addr = lwip_ntohl(pcb->remote_ip.addr);
+    char addr[IPADDR_STRLEN_MAX];
 
     DbgPrint("\tState: %s\n", tcp_state_str[pcb->state]);
-    DbgPrint("\tRemote: (%d.%d.%d.%d, %d)\n",
-    (addr >> 24) & 0xFF,
-    (addr >> 16) & 0xFF,
-    (addr >> 8) & 0xFF,
-    addr & 0xFF,
+    DbgPrint("\tRemote: (%s, %d)\n",
+    ipaddr_ntoa_r(&pcb->remote_ip, addr, sizeof(addr)),
     pcb->remote_port);
 }
 
@@ -66,13 +63,16 @@ LibTCPEmptyQueue(PCONNECTION_ENDPOINT Connection)
     DereferenceObject(Connection);
 }
 
-void LibTCPEnqueuePacket(PCONNECTION_ENDPOINT Connection, struct pbuf *p)
+void LibTCPEnqueuePacket(PCONNECTION_ENDPOINT Connection, PTCP_PCB pcb, struct pbuf *p)
 {
     PQUEUE_ENTRY qp;
 
     qp = (PQUEUE_ENTRY)ExAllocateFromNPagedLookasideList(&QueueEntryLookasideList);
     qp->p = p;
     qp->Offset = 0;
+    qp->Urgent = pcb->urg_in_data;
+    qp->UrgentOffset = pcb->urg_offset;
+    pcb->urg_in_data = 0;
 
     LockObject(Connection);
     InsertTailList(&Connection->PacketQueue, &qp->ListEntry);
@@ -125,8 +125,9 @@ NTSTATUS LibTCPGetDataFromConnectionQueue(PCONNECTION_ENDPOINT Connection, PUCHA
 {
     PQUEUE_ENTRY qp;
     struct pbuf* p;
-    NTSTATUS Status;
+    NTSTATUS Status = STATUS_SUCCESS;
     UINT ReadLength, PayloadLength, Offset, Copied;
+    BOOLEAN AtMark;
 
     (*Received) = 0;
 
@@ -146,6 +147,27 @@ NTSTATUS LibTCPGetDataFromConnectionQueue(PCONNECTION_ENDPOINT Connection, PUCHA
             /* Check if we're reading the whole buffer */
             ReadLength = MIN(PayloadLength, RecvLen);
             ASSERT(ReadLength != 0);
+            AtMark = FALSE;
+
+            if (qp->Urgent && qp->UrgentOffset >= Offset && qp->UrgentOffset - Offset < ReadLength)
+            {
+                if (qp->UrgentOffset == Offset)
+                {
+                    if (*Received != 0)
+                    {
+                        InsertHeadList(&Connection->PacketQueue, &qp->ListEntry);
+                        break;
+                    }
+                    ReadLength = 1;
+                    qp->Urgent = FALSE;
+                    Status = STATUS_RECEIVE_EXPEDITED;
+                }
+                else
+                {
+                    ReadLength = qp->UrgentOffset - Offset;
+                }
+                AtMark = TRUE;
+            }
             if (ReadLength != PayloadLength)
             {
                 /* Save this one for later */
@@ -172,13 +194,14 @@ NTSTATUS LibTCPGetDataFromConnectionQueue(PCONNECTION_ENDPOINT Connection, PUCHA
             else
             {
                 /* If we get here, it means we've filled the buffer */
-                ASSERT(RecvLen == 0);
+                ASSERT(RecvLen == 0 || AtMark);
             }
 
             ASSERT((*Received) != 0);
-            Status = STATUS_SUCCESS;
+            if (Status != STATUS_RECEIVE_EXPEDITED)
+                Status = STATUS_SUCCESS;
 
-            if (!RecvLen)
+            if (!RecvLen || AtMark)
                 break;
         }
     }
@@ -307,7 +330,7 @@ InternalRecvEventHandler(void *arg, PTCP_PCB pcb, struct pbuf *p, const err_t er
             return ERR_OK;
         }
 
-        LibTCPEnqueuePacket(Connection, p);
+        LibTCPEnqueuePacket(Connection, pcb, p);
 
         TCPRecvEventHandler(arg);
     }
@@ -507,7 +530,7 @@ InternalErrorEventHandler(void *arg, const err_t err)
 
     /* Give them one shot to receive the remaining data */
     Connection->ReceiveShutdown = TRUE;
-    Connection->ReceiveShutdownStatus = TCPTranslateError(err);
+    Connection->ReceiveShutdownStatus = (err == ERR_RST) ? STATUS_CONNECTION_RESET : TCPTranslateError(err);
     TCPRecvEventHandler(Connection);
 
     /* Terminate the connection */
@@ -522,7 +545,7 @@ LibTCPSocketCallback(void *arg)
 
     ASSERT(msg);
 
-    msg->Output.Socket.NewPcb = tcp_new();
+    msg->Output.Socket.NewPcb = tcp_new_ip_type(IPADDR_TYPE_ANY);
 
     if (msg->Output.Socket.NewPcb)
     {
@@ -598,7 +621,7 @@ done:
 }
 
 err_t
-LibTCPBind(PCONNECTION_ENDPOINT Connection, ip4_addr_t *const ipaddr, const u16_t port)
+LibTCPBind(PCONNECTION_ENDPOINT Connection, ip_addr_t *const ipaddr, const u16_t port)
 {
     struct lwip_callback_msg msg;
     err_t ret;
@@ -696,6 +719,8 @@ LibTCPSendCallback(void *arg)
 
     SendFlags = TCP_WRITE_FLAG_COPY;
     SendLength = msg->Input.Send.DataLength;
+    if (msg->Input.Send.Flags & TDI_SEND_EXPEDITED)
+        SendFlags |= TCP_WRITE_FLAG_URG;
     if (tcp_sndbuf(pcb) == 0)
     {
         /* No buffer space so return pending */
@@ -709,6 +734,7 @@ LibTCPSendCallback(void *arg)
 
         /* Don't set the push flag */
         SendFlags |= TCP_WRITE_FLAG_MORE;
+        SendFlags &= ~TCP_WRITE_FLAG_URG;
     }
 
     if (!WfpShimClassifyStream(msg->Input.Send.Connection->WfpEndpointId,
@@ -742,7 +768,7 @@ done:
 }
 
 err_t
-LibTCPSend(PCONNECTION_ENDPOINT Connection, void *const dataptr, const u16_t len, ULONG *sent, const int safe)
+LibTCPSend(PCONNECTION_ENDPOINT Connection, void *const dataptr, const u32_t len, ULONG *sent, ULONG Flags, const int safe)
 {
     err_t ret;
     struct lwip_callback_msg msg;
@@ -750,6 +776,7 @@ LibTCPSend(PCONNECTION_ENDPOINT Connection, void *const dataptr, const u16_t len
     msg.Input.Send.Connection = Connection;
     msg.Input.Send.Data = dataptr;
     msg.Input.Send.DataLength = len;
+    msg.Input.Send.Flags = Flags;
 
     if (safe)
         LibTCPSendCallback(&msg);
@@ -896,6 +923,54 @@ LibTCPShutdown(PCONNECTION_ENDPOINT Connection, const int shut_rx, const int shu
     msg.Input.Shutdown.shut_tx = shut_tx;
 
     Error = tcpip_callback_wait(LibTCPShutdownCallback, &msg);
+    if (Error != ERR_OK)
+        return Error;
+
+    return msg.Output.Shutdown.Error;
+}
+
+static
+void
+LibTCPAbortCallback(void *arg)
+{
+    struct lwip_callback_msg *msg = arg;
+    PCONNECTION_ENDPOINT Connection = msg->Input.Shutdown.Connection;
+    PTCP_PCB pcb = Connection->SocketContext;
+
+    if (!pcb)
+    {
+        msg->Output.Shutdown.Error = ERR_CLSD;
+        return;
+    }
+
+    if (!Connection->SendShutdown && pcb->state == ESTABLISHED)
+    {
+        WfpShimClassifyStream(Connection->WfpEndpointId,
+                              WFP_SHIM_STREAM_SEND | WFP_SHIM_STREAM_DISCONNECT,
+                              NULL,
+                              0);
+    }
+
+    Connection->SocketContext = NULL;
+    Connection->ReceiveShutdown = TRUE;
+    Connection->ReceiveShutdownStatus = STATUS_FILE_CLOSED;
+    Connection->SendShutdown = TRUE;
+    tcp_arg(pcb, NULL);
+    tcp_abort(pcb);
+
+    TCPFinEventHandler(Connection, ERR_ABRT);
+    msg->Output.Shutdown.Error = ERR_OK;
+}
+
+err_t
+LibTCPAbort(PCONNECTION_ENDPOINT Connection)
+{
+    struct lwip_callback_msg msg;
+    err_t Error;
+
+    msg.Input.Shutdown.Connection = Connection;
+
+    Error = tcpip_callback_wait(LibTCPAbortCallback, &msg);
     if (Error != ERR_OK)
         return Error;
 

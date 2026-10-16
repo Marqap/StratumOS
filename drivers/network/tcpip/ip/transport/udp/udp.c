@@ -61,10 +61,13 @@ NTSTATUS AddUDPHeaderIPv4(
 
     RtlCopyMemory(IPPacket->Data, Data, DataLength);
 
-    UDPHeader->Checksum = UDPv4ChecksumCalculate((PIPv4_HEADER)IPPacket->Header,
-                                                 (PUCHAR)UDPHeader,
-                                                 DataLength + sizeof(UDP_HEADER));
-    UDPHeader->Checksum = WH2N(UDPHeader->Checksum);
+    if (!AddrFile->NoChecksum)
+    {
+        UDPHeader->Checksum = UDPv4ChecksumCalculate((PIPv4_HEADER)IPPacket->Header,
+                                                     (PUCHAR)UDPHeader,
+                                                     DataLength + sizeof(UDP_HEADER));
+        UDPHeader->Checksum = WH2N(UDPHeader->Checksum);
+    }
 
     TI_DbgPrint(MID_TRACE, ("Packet: %d ip %d udp %d payload\n",
 			    (PCHAR)UDPHeader - (PCHAR)IPPacket->Header,
@@ -241,8 +244,10 @@ static NTSTATUS UDPSendToAddress(
     PNEIGHBOR_CACHE_ENTRY NCE;
     PNEIGHBOR_CACHE_ENTRY LoopNCE = NULL;
     BOOLEAN IsBroadcast;
+    BOOLEAN IsMulticast;
 
     IsBroadcast = UDPIsBroadcastAddress(&RemoteAddress);
+    IsMulticast = ((DN2H(RemoteAddress.Address.IPv4Address) & 0xf0000000) == 0xe0000000);
 
     LockObject(AddrFile);
 
@@ -256,6 +261,20 @@ static NTSTATUS UDPSendToAddress(
         {
             UnlockObject(AddrFile);
             return STATUS_NETWORK_UNREACHABLE;
+        }
+        if (AddrIsUnspecified(&LocalAddress)) LocalAddress = NCE->Interface->Unicast;
+    }
+    else if (AddrFile->UnicastInterface)
+    {
+        PIP_INTERFACE Interface = GetMulticastInterface(AddrFile->UnicastInterface);
+
+        NCE = Interface ? RouteGetRouteOnInterface(&RemoteAddress, Interface) : NULL;
+        if (Interface)
+            IPDereferenceInterface(Interface);
+        if (!NCE)
+        {
+            UnlockObject(AddrFile);
+            return STATUS_INVALID_ADDRESS;
         }
         if (AddrIsUnspecified(&LocalAddress)) LocalAddress = NCE->Interface->Unicast;
     }
@@ -311,7 +330,7 @@ static NTSTATUS UDPSendToAddress(
 							 BufferData,
 							 DataSize );
 
-    if (NT_SUCCESS(Status) && IsBroadcast && Loopback != NULL && NCE->Interface != Loopback)
+    if (NT_SUCCESS(Status) && (IsBroadcast || IsMulticast) && Loopback != NULL && NCE->Interface != Loopback)
     {
         LoopNCE = NBLocateNeighbor(&Loopback->Unicast, Loopback);
         if (LoopNCE != NULL &&
@@ -372,6 +391,9 @@ NTSTATUS UDPSendDatagram(
     IP_ADDRESS RemoteAddress;
     USHORT RemotePort;
     NTSTATUS Status;
+    ULONG SendMsgSize;
+    ULONG Offset;
+    ULONG Chunk;
 
     TI_DbgPrint(MID_TRACE,("Sending Datagram(%x %x %x %d)\n",
 						   AddrFile, ConnInfo, BufferData, DataSize));
@@ -389,9 +411,19 @@ NTSTATUS UDPSendDatagram(
 		return STATUS_UNSUCCESSFUL;
     }
 
-    Status = UDPSendToAddress(AddrFile, RemoteAddress, RemotePort, BufferData, DataSize, &NoTag);
-    if (!NT_SUCCESS(Status))
-        return Status;
+    SendMsgSize = AddrFile->SendMsgSize;
+    if (SendMsgSize == 0 || SendMsgSize >= DataSize)
+        SendMsgSize = DataSize;
+
+    Offset = 0;
+    do
+    {
+        Chunk = min(SendMsgSize, DataSize - Offset);
+        Status = UDPSendToAddress(AddrFile, RemoteAddress, RemotePort, BufferData + Offset, Chunk, &NoTag);
+        if (!NT_SUCCESS(Status))
+            return Status;
+        Offset += Chunk;
+    } while (Offset < DataSize);
 
     *DataUsed = DataSize;
 
@@ -575,6 +607,9 @@ VOID UDPReceive(PIP_INTERFACE Interface, PIP_PACKET IPPacket)
   PUDP_HEADER UDPHeader;
   PIP_ADDRESS DstAddress, SrcAddress;
   UINT DataSize, i;
+  BOOLEAN IsMulticast;
+  ULONG MemberIndex;
+  PIP_INTERFACE SourceInterface;
 
   TI_DbgPrint(MAX_TRACE, ("Called.\n"));
 
@@ -622,6 +657,15 @@ VOID UDPReceive(PIP_INTERFACE Interface, PIP_PACKET IPPacket)
   /* Go to UDP data area */
   IPPacket->Data = (PVOID)((ULONG_PTR)IPPacket->Data + sizeof(UDP_HEADER));
 
+  IsMulticast = ((DN2H(DstAddress->Address.IPv4Address) & 0xf0000000) == 0xe0000000);
+  MemberIndex = Interface->Index;
+  if (IsMulticast && Interface == Loopback &&
+      (SourceInterface = AddrLocateInterface(SrcAddress)))
+  {
+      MemberIndex = SourceInterface->Index;
+      IPDereferenceInterface(SourceInterface);
+  }
+
   /* Locate a receive request on destination address file object
      and deliver the packet if one is found. If there is no receive
      request on the address file object, call the associated receive
@@ -633,7 +677,8 @@ VOID UDPReceive(PIP_INTERFACE Interface, PIP_PACKET IPPacket)
                              &SearchContext);
   if (AddrFile) {
     do {
-      if (UDPClassify(AddrFile,
+      if ((!IsMulticast || IGMPIsMember(AddrFile, MemberIndex, DstAddress->Address.IPv4Address)) &&
+          UDPClassify(AddrFile,
                       FALSE,
                       Interface,
                       DstAddress,
@@ -653,7 +698,8 @@ VOID UDPReceive(PIP_INTERFACE Interface, PIP_PACKET IPPacket)
 		    UDPHeader->SourcePort,
 		    UDPHeader->DestPort,
                     IPPacket,
-                    DataSize);
+                    DataSize,
+                    Interface);
       }
       DereferenceObject(AddrFile);
     } while ((AddrFile = AddrSearchNext(&SearchContext)) != NULL);

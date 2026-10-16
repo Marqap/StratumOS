@@ -29,7 +29,7 @@ LIST_ENTRY ServiceListHead;
 
 static RTL_RESOURCE DatabaseLock;
 static DWORD ResumeCount = 1;
-static DWORD NoInteractiveServices = 0;
+static DWORD NoInteractiveServices = 1;
 static DWORD ServiceTag = 0;
 
 /* The critical section synchronizes service control requests */
@@ -2497,6 +2497,8 @@ ScmAutoShutdownServices(VOID)
 {
     PLIST_ENTRY ServiceEntry;
     PSERVICE CurrentService;
+    HANDLE hControlPipe;
+    DWORD dwResumeCount;
 
     DPRINT("ScmAutoShutdownServices() called\n");
 
@@ -2514,10 +2516,18 @@ ScmAutoShutdownServices(VOID)
         {
             /* Send the shutdown notification */
             DPRINT("Shutdown service: %S\n", CurrentService->lpServiceName);
-            ScmControlService(CurrentService->lpImage->hControlPipe,
+            hControlPipe = CurrentService->lpImage->hControlPipe;
+            dwResumeCount = CurrentService->dwResumeCount;
+            ScmReferenceService(CurrentService);
+            ScmUnlockDatabase();
+            ScmControlService(hControlPipe,
                               CurrentService->lpServiceName,
                               SERVICE_CONTROL_SHUTDOWN,
-                              CurrentService->dwResumeCount);
+                              dwResumeCount);
+            ScmLockDatabaseExclusive();
+            ServiceEntry = ServiceEntry->Flink;
+            ScmDereferenceService(CurrentService);
+            continue;
         }
 
         ServiceEntry = ServiceEntry->Flink;

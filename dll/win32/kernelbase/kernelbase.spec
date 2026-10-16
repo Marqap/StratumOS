@@ -14,6 +14,7 @@
 @ stdcall AddAuditAccessObjectAce(ptr long long long ptr ptr ptr long long)
 @ stdcall AddConsoleAliasA(str str str)
 @ stdcall AddConsoleAliasW(wstr wstr wstr)
+@ stdcall AddDependencyToProcessPackageGraph(wstr ptr ptr ptr)
 @ stdcall AddMandatoryAce(ptr long long long ptr)
 @ stdcall AddResourceAttributeAce(ptr long long long ptr ptr ptr)
 @ stdcall AddSIDToBoundaryDescriptor(ptr ptr) kernel32.AddSIDToBoundaryDescriptor
@@ -28,9 +29,13 @@
 @ stdcall AppContainerLookupMoniker(ptr ptr)
 @ stdcall AppContainerRegisterSid(ptr wstr wstr)
 @ stdcall AppContainerUnregisterSid(ptr)
+@ stdcall AppXFreeMemory(ptr)
+@ stdcall AppXGetPackageSid(wstr ptr)
 @ stdcall AreAllAccessesGranted(long long)
 @ stdcall AreAnyAccessesGranted(long long)
 @ stdcall AttachConsole(long)
+@ stdcall BaseFreeAppCompatDataForProcess(ptr) kernel32.BaseFreeAppCompatDataForProcess
+@ stdcall BaseReadAppCompatDataForProcess(ptr ptr ptr) kernel32.BaseReadAppCompatDataForProcess
 @ stdcall BasepAdjustObjectAttributesForPrivateNamespace(ptr) kernel32.BasepAdjustObjectAttributesForPrivateNamespace
 @ stdcall CancelSynchronousIo(long)
 @ stdcall CancelThreadpoolIo(ptr) ntdll.TpCancelAsyncIoOperation
@@ -106,6 +111,13 @@
 @ stdcall EnumCalendarInfoExEx(ptr wstr long wstr long long)
 @ stdcall EnumCalendarInfoExW(ptr long long long)
 @ stdcall EnumCalendarInfoW(ptr long long long)
+@ stdcall EnumResourceLanguagesExA(long str str ptr long long long) kernel32.EnumResourceLanguagesExA
+@ stdcall EnumResourceLanguagesExW(long wstr wstr ptr long long long) kernel32.EnumResourceLanguagesExW
+@ stdcall EnumResourceNamesExA(long str ptr long long long) kernel32.EnumResourceNamesExA
+@ stdcall EnumResourceNamesExW(long wstr ptr long long long) kernel32.EnumResourceNamesExW
+@ stdcall EnumResourceNamesW(long wstr ptr long) kernel32.EnumResourceNamesW
+@ stdcall EnumResourceTypesExA(long ptr long long long) kernel32.EnumResourceTypesExA
+@ stdcall EnumResourceTypesExW(long ptr long long long) kernel32.EnumResourceTypesExW
 @ stdcall EnumSystemGeoID(long long ptr)
 @ stdcall EnumSystemLocalesA(ptr long)
 @ stdcall EnumSystemLocalesEx(ptr long long ptr)
@@ -188,6 +200,7 @@
 @ stdcall GetExitCodeProcess(long ptr) kernel32.GetExitCodeProcess
 @ stdcall GetExitCodeThread(long ptr) kernel32.GetExitCodeThread
 @ stdcall GetFileMUIInfo(long wstr ptr ptr)
+@ stdcall GetFileMUIPath(long wstr wstr ptr wstr ptr ptr) kernel32.GetFileMUIPath
 @ stdcall GetFileSecurityW(wstr long ptr long ptr)
 @ stdcall GetFileVersionInfoA(str long long ptr)
 @ stdcall GetFileVersionInfoExA(long str long long ptr)
@@ -209,6 +222,7 @@
 @ stdcall GetNumberOfConsoleMouseButtons(ptr)
 @ stdcall GetPackageFamilyName(long ptr ptr)
 @ stdcall GetPackageFamilyNameFromToken(ptr ptr ptr)
+@ stdcall GetPackageFullName(long ptr ptr)
 @ stdcall GetPackageFullNameFromToken(ptr ptr ptr)
 @ stdcall GetPriorityClass(long) kernel32.GetPriorityClass
 @ stdcall GetPrivateObjectSecurity(ptr long ptr long ptr)
@@ -236,6 +250,7 @@
 @ stdcall GetStringTypeW(long wstr long ptr)
 @ stdcall GetSystemCpuSetInformation(ptr long ptr ptr long)
 @ stdcall GetSystemPreferredUILanguages(long ptr ptr ptr)
+@ stdcall GetProcessorSystemCycleTime(long ptr ptr) kernel32.GetProcessorSystemCycleTime
 @ stdcall GetTempPath2A(long ptr) kernel32.GetTempPath2A
 @ stdcall GetTempPath2W(long ptr) kernel32.GetTempPath2W
 @ stdcall GetThreadDescription(ptr ptr)
@@ -329,6 +344,8 @@
 @ stdcall OpenProcessToken(long long ptr)
 @ stdcall OpenThread(long long long) kernel32.OpenThread
 @ stdcall OpenThreadToken(long long long ptr)
+@ stdcall PackageFamilyNameFromFullName(wstr ptr ptr)
+@ stdcall ParseApplicationUserModelId(wstr ptr ptr ptr ptr)
 @ stdcall ParseURLA(str ptr)
 @ stdcall ParseURLW(wstr ptr)
 @ stdcall PathAddBackslashA(str)

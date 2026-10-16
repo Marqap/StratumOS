@@ -13,6 +13,7 @@ BOOL FASTCALL RegisterControlAtoms(VOID);
 /* GLOBALS ********************************************************************/
 
 PPROCESSINFO gppiInputProvider = NULL;
+static BOOLEAN gbGreInitialized = FALSE;
 BOOL g_AlwaysDisplayVersion = FALSE;
 USER_CRIT gUserCrit;
 USER_DOMAIN_LOCK gUserDomainLocks[DLT_MAX];
@@ -301,12 +302,14 @@ NtUserInitialize(
     HANDLE hMediaRequestEvent)
 {
     NTSTATUS Status;
+    PUSER_SESSION Session;
 
     TRACE("Enter NtUserInitialize(%lx, %p, %p)\n",
           dwWinVersion, hPowerRequestEvent, hMediaRequestEvent);
 
     /* Check if we are already initialized */
-    if (gpepCSRSS)
+    Session = UserGetCurrentSession();
+    if (Session && Session->CsrProcess)
         return STATUS_UNSUCCESSFUL;
 
     /* Check Windows USER subsystem version */
@@ -319,8 +322,40 @@ NtUserInitialize(
     /* Acquire exclusive lock */
     UserEnterExclusive();
 
+    Status = UserCreateSession(PsGetCurrentProcessSessionId(), &Session);
+    if (!NT_SUCCESS(Status))
+    {
+        UserLeave();
+        return Status;
+    }
+    if (Session->CsrProcess)
+    {
+        UserLeave();
+        return STATUS_UNSUCCESSFUL;
+    }
+
     /* Save the EPROCESS of CSRSS */
-    InitCsrProcess(/*PsGetCurrentProcess()*/);
+    InitCsrProcess(Session);
+
+    /* Initialize various GDI stuff (DirectX, fonts, language ID etc.) */
+    if (!gbGreInitialized)
+    {
+        if (!InitializeGreCSRSS())
+        {
+            UserLeave();
+            return STATUS_UNSUCCESSFUL;
+        }
+        gbGreInitialized = TRUE;
+    }
+
+    if (Session->SessionId == 0 || gpDisplaySession)
+    {
+        Status = UserCreateWinstaDirectory();
+        UserLeave();
+        return Status;
+    }
+
+    WritePointerRelease((PVOID volatile *)&gpDisplaySession, Session);
 
     /* Initialize Power Request List */
     Status = IntInitWin32PowerManagement(hPowerRequestEvent);
@@ -331,10 +366,6 @@ NtUserInitialize(
     }
 
 // Initialize Media Change (use hMediaRequestEvent).
-
-    /* Initialize various GDI stuff (DirectX, fonts, language ID etc.) */
-    if (!InitializeGreCSRSS())
-        return STATUS_UNSUCCESSFUL;
 
     /* Initialize USER */
     Status = UserInitialize();

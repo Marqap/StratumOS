@@ -134,11 +134,7 @@ if(MSVC)
         set(_WINKD_ FALSE CACHE BOOL "Whether to compile with the KD protocol.")
     endif()
 else()
-    if(DBG)
-        set(KDBG TRUE CACHE BOOL "Whether to compile in the integrated kernel debugger.")
-    else()
-        set(KDBG FALSE CACHE BOOL "Whether to compile in the integrated kernel debugger.")
-    endif()
+    set(KDBG TRUE CACHE BOOL "Whether to compile in the integrated kernel debugger.")
     set(_WINKD_ FALSE CACHE BOOL "Whether to compile with the KD protocol.")
 endif()
 
@@ -170,6 +166,8 @@ elseif(_REACTOS_KD_DEBUGGER STREQUAL "EXTERNAL")
     else()
         set(GDB FALSE)
     endif()
+elseif(NOT MSVC)
+    set(KDBG TRUE)
 endif()
 
 if(KDBG AND _REACTOS_KD_DEBUGGER STREQUAL "AUTO" AND (ARCH STREQUAL "i386" OR ARCH STREQUAL "amd64") AND
@@ -256,6 +254,10 @@ cmake_dependent_option(ENABLE_FFMPEG
                        "Build the LGPL FFmpeg libraries behind the H.264 and AAC Media Foundation decoders" OFF
                        "ARCH STREQUAL i386 OR ARCH STREQUAL amd64 OR ARCH STREQUAL arm64;CMAKE_C_COMPILER_ID STREQUAL Clang;NOT MSVC" OFF)
 
+cmake_dependent_option(ENABLE_DXILCONV
+                       "Build dxilconv.dll, the DXBC to DXIL converter of the Direct3D 12 runtime, from the dxc feed" OFF
+                       "ARCH STREQUAL i386 OR ARCH STREQUAL amd64 OR ARCH STREQUAL arm64;CMAKE_C_COMPILER_ID STREQUAL Clang;NOT MSVC" OFF)
+
 set(_wow64_default OFF)
 if((ARCH STREQUAL "amd64" OR ARCH STREQUAL "arm64") AND NOT ARM64EC_RUNTIME)
     set(_wow64_default ON)
@@ -272,6 +274,10 @@ endif()
 option(VALIDATE_COMPAT_BINARIES
        "Validate ARM64EC and WoW64 binaries after their nested builds." ${_validate_compat_default})
 unset(_validate_compat_default)
+
+option(ENABLE_RT2800USB "Whether to build the Ralink RT2870/RT2770 USB Wi-Fi driver." OFF)
+
+option(ENABLE_RTW8852BS "Whether to build the Realtek RTL8852BS SDIO Wi-Fi driver." OFF)
 
 cmake_dependent_option(ENABLE_ROSV
                        "Whether to build the ROSV VMX hypervisor driver and its user-mode tools." OFF

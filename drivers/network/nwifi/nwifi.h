@@ -28,6 +28,17 @@
  * ===========================================================================
  */
 #define IEEE80211_ADDR_LEN          6
+#define IEEE80211_ELEMENT_RATES     1
+#define IEEE80211_ELEMENT_RSN       48
+#define IEEE80211_ELEMENT_EXT_RATES 50
+#define IEEE80211_ELEMENT_RSNXE     244
+#define IEEE80211_ELEMENT_EXTENSION 255
+#define IEEE80211_EXT_ANTI_CLOGGING_TOKEN 93
+#define IEEE80211_RSNXE_SAE_H2E     0x20
+#define IEEE80211_SELECTOR_SAE_H2E_ONLY 123
+#define IEEE80211_STATUS_SAE_ANTI_CLOGGING 76
+#define IEEE80211_STATUS_SAE_UNSUPPORTED_GROUP 77
+#define IEEE80211_STATUS_SAE_HASH_TO_ELEMENT 126
 
 /* Frame Control field (little-endian on the air). */
 #define IEEE80211_FC0_VERSION_0     0x00
@@ -43,6 +54,11 @@
 #define IEEE80211_FC1_DIR_FROMDS    0x02    /* AP   -> STA (infra downlink) */
 #define IEEE80211_FC1_DIR_DSTODS    0x03    /* WDS */
 #define IEEE80211_FC1_PROTECTED     0x40
+#define IEEE80211_FC1_ORDER         0x80
+#define IEEE80211_QOS_CONTROL_LEN   2
+#define IEEE80211_HT_CONTROL_LEN    4
+#define IEEE80211_ASSOC_REQ_FIXED_LEN   4
+#define IEEE80211_REASSOC_REQ_FIXED_LEN 10
 
 /* 3-address 802.11 MAC header; Addr1/2/3 are interpreted per the ToDS/FromDS
  * bits.  Only the non-QoS 3-address data form is generated/parsed. */
@@ -150,6 +166,8 @@ typedef struct _NWIFI_ADAPTER
 
     /* ---- Shared identity / state ---- */
     UCHAR         MacAddress[IEEE80211_ADDR_LEN];   /* lower MAC == upper MAC */
+    GUID          InterfaceGuid;
+    GUID          AdapterGuid;
     NWIFI_STATE   State;
     ULONG         CurrentPacketFilter;
     ULONG         CurrentLookahead;

@@ -12,6 +12,7 @@
 
 /* Forward declarations. */
 static VOID NwifiAggregateBssList(_In_ PNWIFI_MSM Msm);
+static NDIS_STATUS NwifiMsmDisconnectLower(_In_ PNWIFI_MSM Msm);
 
 /* ===========================================================================
  *  Small helpers
@@ -299,6 +300,46 @@ NwifiProgramCipherAlgorithm(
                                   Oid, &List, sizeof(List), NULL);
 }
 
+static
+BOOLEAN
+NwifiAuthCipherSupported(
+    _In_ PNWIFI_ADAPTER Adapter,
+    _In_ DOT11_AUTH_ALGORITHM AuthAlgorithm,
+    _In_ DOT11_CIPHER_ALGORITHM CipherAlgorithm)
+{
+    PDOT11_AUTH_CIPHER_PAIR_LIST List;
+    ULONG BufferSize = FIELD_OFFSET(DOT11_AUTH_CIPHER_PAIR_LIST, AuthCipherPairs) +
+                       64 * sizeof(DOT11_AUTH_CIPHER_PAIR);
+    ULONG Capacity = 64;
+    BOOLEAN Supported = TRUE;
+    NDIS_STATUS Status;
+    ULONG i;
+
+    List = (PDOT11_AUTH_CIPHER_PAIR_LIST)NwifiAllocate(BufferSize);
+    if (List == NULL)
+        return TRUE;
+
+    Status = NwifiProtocolDoRequest(Adapter, NdisRequestQueryInformation,
+                                    OID_DOT11_SUPPORTED_UNICAST_ALGORITHM_PAIR,
+                                    List, BufferSize, NULL);
+    if (Status == NDIS_STATUS_SUCCESS)
+    {
+        Supported = FALSE;
+        for (i = 0; i < List->uNumOfEntries && i < Capacity; i++)
+        {
+            if (List->AuthCipherPairs[i].AuthAlgoId == AuthAlgorithm &&
+                List->AuthCipherPairs[i].CipherAlgoId == CipherAlgorithm)
+            {
+                Supported = TRUE;
+                break;
+            }
+        }
+    }
+
+    NwifiFree(List);
+    return Supported;
+}
+
 /* OID_DOT11_DESIRED_BSS_TYPE: a bare DOT11_BSS_TYPE. */
 static
 NDIS_STATUS
@@ -360,7 +401,7 @@ NwifiMsmStartScan(
     RtlFillMemory(Scan->dot11BSSID, IEEE80211_ADDR_LEN, 0xFF);    /* any BSSID */
     Scan->dot11ScanType = dot11_scan_type_auto;
     Scan->bRestrictedScan = FALSE;
-    Scan->udot11SSIDsOffset = FIELD_OFFSET(DOT11_SCAN_REQUEST_V2, ucBuffer);
+    Scan->udot11SSIDsOffset = 0;
     Scan->uNumOfdot11SSIDs = 1;
     Scan->bUseRequestIE = FALSE;
     Scan->uRequestIDsOffset = 0;
@@ -423,7 +464,7 @@ NwifiAggregateBssList(
         return;
     }
 
-    Status = NwifiProtocolDoRequest(Adapter, NdisRequestQueryInformation,
+    Status = NwifiProtocolDoRequest(Adapter, NdisRequestMethod,
                                     OID_DOT11_ENUM_BSS_LIST,
                                     ByteArray, BufferSize, &Got);
     if (Status != NDIS_STATUS_SUCCESS ||
@@ -549,9 +590,19 @@ NwifiMsmConnect(
 {
     PNWIFI_ADAPTER Adapter = Msm->Adapter;
     NDIS_STATUS Status;
+    BOOLEAN Connected;
 
     NdisAcquireSpinLock(&Msm->Lock);
-    if (Msm->State != NwifiMsmIdle)
+    Connected = (Msm->State != NwifiMsmIdle && Msm->State != NwifiMsmScanning);
+    NdisReleaseSpinLock(&Msm->Lock);
+    if (Connected)
+    {
+        NwifiSupplicantResetSession(Msm);
+        NwifiMsmDisconnectLower(Msm);
+    }
+
+    NdisAcquireSpinLock(&Msm->Lock);
+    if (Msm->State != NwifiMsmIdle && Msm->State != NwifiMsmScanning)
     {
         NdisReleaseSpinLock(&Msm->Lock);
         return NDIS_STATUS_MEDIA_BUSY;
@@ -560,6 +611,14 @@ NwifiMsmConnect(
     Msm->CurrentSsid = Params->Ssid;
     Msm->State = NwifiMsmAssociating;
     NdisReleaseSpinLock(&Msm->Lock);
+
+    if (!NwifiAuthCipherSupported(Adapter, Params->AuthAlgorithm, Params->UnicastCipher))
+    {
+        DPRINT1("NWIFI: auth %u cipher 0x%x not supported by the adapter\n",
+                Params->AuthAlgorithm, Params->UnicastCipher);
+        Status = NDIS_STATUS_NOT_SUPPORTED;
+        goto ConnectFailed;
+    }
 
     Status = NwifiProgramBssType(Adapter, Params->BssType);
     if (Status != NDIS_STATUS_SUCCESS)
@@ -616,7 +675,11 @@ NwifiMsmConnect(
         if (Params->AuthAlgorithm == DOT11_AUTH_ALGO_RSNA_PSK ||
             Params->AuthAlgorithm == DOT11_AUTH_ALGO_WPA3_SAE)
         {
-            Status = NwifiSupplicantSeedFirmware(Msm);
+            Status = NwifiSupplicantStart(Msm);
+            if (Status == NDIS_STATUS_SUCCESS)
+            {
+                NwifiSupplicantSeedFirmware(Msm);
+            }
         }
         else
         {
@@ -667,10 +730,17 @@ NDIS_STATUS
 NwifiMsmDisconnect(
     _In_ PNWIFI_MSM Msm)
 {
+    NwifiSupplicantStop(Msm);
+    return NwifiMsmDisconnectLower(Msm);
+}
+
+static
+NDIS_STATUS
+NwifiMsmDisconnectLower(
+    _In_ PNWIFI_MSM Msm)
+{
     PNWIFI_ADAPTER Adapter = Msm->Adapter;
     NDIS_STATUS Status;
-
-    NwifiSupplicantStop(Msm);
 
     Status = NwifiProtocolDoRequest(Adapter, NdisRequestSetInformation,
                                     OID_DOT11_DISCONNECT_REQUEST,
@@ -845,7 +915,20 @@ NwifiMsmIndicateStatus(
 
                         if (Msm->Supplicant != NULL)
                         {
-                            NwifiSupplicantSetApAddr(Msm, P->MacAddr);
+                            PUCHAR RequestIes = NULL;
+                            ULONG RequestIeLength = 0;
+
+                            ULONG FixedLength = P->bReAssocReq ? IEEE80211_REASSOC_REQ_FIXED_LEN
+                                                               : IEEE80211_ASSOC_REQ_FIXED_LEN;
+
+                            if (P->uAssocReqSize > FixedLength &&
+                                P->uAssocReqOffset <= BufferSize &&
+                                P->uAssocReqSize <= BufferSize - P->uAssocReqOffset)
+                            {
+                                RequestIes = (PUCHAR)Buffer + P->uAssocReqOffset + FixedLength;
+                                RequestIeLength = P->uAssocReqSize - FixedLength;
+                            }
+                            NwifiSupplicantSetAssociation(Msm, P->MacAddr, RequestIes, RequestIeLength);
                         }
 
                         NdisAcquireSpinLock(&Msm->Lock);
@@ -911,7 +994,7 @@ NwifiMsmIndicateStatus(
             }
             DPRINT1("NWIFI: disassociation reason 0x%08X\n", Reason);
 
-            NwifiSupplicantStop(Msm);
+            NwifiSupplicantResetSession(Msm);
             NdisAcquireSpinLock(&Msm->Lock);
             Msm->State = NwifiMsmIdle;
             NdisReleaseSpinLock(&Msm->Lock);
@@ -1018,6 +1101,49 @@ NwifiMsmRxData(
  *  BSS list export to wlansvc (IOCTL_NWIFI_GET_BSS_LIST)
  * ===========================================================================
  */
+BOOLEAN
+NwifiMsmBssUsesSaeH2e(
+    _In_ PNWIFI_MSM Msm,
+    _In_reads_bytes_(IEEE80211_ADDR_LEN) const UCHAR *Bssid)
+{
+    BOOLEAN H2e = FALSE;
+    ULONG i, Off, j;
+    PUCHAR Ie;
+    UCHAR Id, Len;
+
+    NwifiAggregateBssList(Msm);
+
+    NdisAcquireSpinLock(&Msm->Lock);
+    for (i = 0; i < Msm->BssCount && !H2e; i++)
+    {
+        if (!Msm->BssCache[i].Valid ||
+            RtlCompareMemory(Msm->BssCache[i].Bssid, Bssid, IEEE80211_ADDR_LEN) != IEEE80211_ADDR_LEN)
+        {
+            continue;
+        }
+        Ie = Msm->BssCache[i].Ie;
+        for (Off = 0; Off + 2 <= Msm->BssCache[i].IeLength && !H2e; Off += 2 + Len)
+        {
+            Id = Ie[Off];
+            Len = Ie[Off + 1];
+            if (Off + 2 + Len > Msm->BssCache[i].IeLength)
+                break;
+            if (Id == IEEE80211_ELEMENT_RSNXE && Len >= 1 && (Ie[Off + 2] & IEEE80211_RSNXE_SAE_H2E))
+                H2e = TRUE;
+            if (Id == IEEE80211_ELEMENT_RATES || Id == IEEE80211_ELEMENT_EXT_RATES)
+            {
+                for (j = 0; j < Len; j++)
+                {
+                    if (Ie[Off + 2 + j] == (0x80 | IEEE80211_SELECTOR_SAE_H2E_ONLY))
+                        H2e = TRUE;
+                }
+            }
+        }
+    }
+    NdisReleaseSpinLock(&Msm->Lock);
+    return H2e;
+}
+
 NDIS_STATUS
 NwifiMsmGetBssList(
     _In_ PNWIFI_MSM Msm,

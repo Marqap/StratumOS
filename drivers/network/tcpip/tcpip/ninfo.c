@@ -10,13 +10,14 @@
 
 #include "precomp.h"
 
+#include <tcpip_undoc.h>
+
 #define IP_ROUTE_TYPE_ADD 3
 #define IP_ROUTE_TYPE_DEL 2
 
 /* Get IPRouteEntry s for each of the routes in the system */
 TDI_STATUS InfoTdiQueryGetRouteTable( PIP_INTERFACE IF, PNDIS_BUFFER Buffer, PUINT BufferSize ) {
     TDI_STATUS Status;
-    KIRQL OldIrql;
     UINT RtCount;
     UINT Capacity = CountFIBs(IF);
     UINT Size;
@@ -99,17 +100,7 @@ TDI_STATUS InfoTdiQueryGetRouteTable( PIP_INTERFACE IF, PNDIS_BUFFER Buffer, PUI
 	      RtCurrent->Gw,
 	      RtCurrent->Metric1 ));
 
-	TcpipAcquireSpinLock(&EntityListLock, &OldIrql);
-	for (i = 0; i < EntityCount; i++)
-             if (EntityList[i].context == IF)
-                 break;
-
-        if (i < EntityCount)
-            RtCurrent->Index = EntityList[i].tei_instance;
-        else
-            RtCurrent->Index = 0;
-
-	TcpipReleaseSpinLock(&EntityListLock, OldIrql);
+	RtCurrent->Index = IF->Index;
 
 	RtCurrent++; RCacheCur++;
     }
@@ -154,7 +145,7 @@ TDI_STATUS InfoTdiQueryGetAddrTable(TDIEntityID ID,
         return TDI_INVALID_PARAMETER;
     }
 
-    IPEntry = ExAllocatePoolWithTag(NonPagedPool, sizeof(IPADDR_ENTRY), IP_ADDRESS_TAG);
+    IPEntry = ExAllocatePoolZero(NonPagedPool, sizeof(IPADDR_ENTRY), IP_ADDRESS_TAG);
     if (!IPEntry)
     {
         TcpipReleaseSpinLock(&EntityListLock, OldIrql);
@@ -255,7 +246,7 @@ TDI_STATUS InfoTdiQueryGetConnectionTcpTable(PADDRESS_FILE AddrFile,
     {
         TA_IP_ADDRESS EndPoint;
 
-        Status = TCPGetSockAddress(AddrFile->Connection, (PTRANSPORT_ADDRESS)&EndPoint, FALSE);
+        Status = TCPGetSockAddress(AddrFile->Connection, (PTRANSPORT_ADDRESS)&EndPoint, sizeof(EndPoint), FALSE);
         if (NT_SUCCESS(Status))
         {
             ASSERT(EndPoint.TAAddressCount >= 1);
@@ -263,7 +254,7 @@ TDI_STATUS InfoTdiQueryGetConnectionTcpTable(PADDRESS_FILE AddrFile,
             TcpRow.dwLocalAddr = EndPoint.Address[0].Address[0].in_addr;
             TcpRow.dwLocalPort = EndPoint.Address[0].Address[0].sin_port;
 
-            Status = TCPGetSockAddress(AddrFile->Connection, (PTRANSPORT_ADDRESS)&EndPoint, TRUE);
+            Status = TCPGetSockAddress(AddrFile->Connection, (PTRANSPORT_ADDRESS)&EndPoint, sizeof(EndPoint), TRUE);
             if (NT_SUCCESS(Status))
             {
                 ASSERT(EndPoint.TAAddressCount >= 1);
@@ -291,6 +282,47 @@ TDI_STATUS InfoTdiQueryGetConnectionTcpTable(PADDRESS_FILE AddrFile,
 
     TI_DbgPrint(DEBUG_INFO, ("Returning %08x\n", Status));
 
+    return Status;
+}
+
+TDI_STATUS InfoTdiSetConnectionTcp(PADDRESS_FILE AddrFile,
+                                   PVOID Buffer,
+                                   UINT BufferSize)
+{
+    PMIB_TCPROW Row = Buffer;
+    PCONNECTION_ENDPOINT Connection;
+    TA_IP_ADDRESS Local, Remote;
+    TDI_STATUS Status = TDI_INVALID_REQUEST;
+
+    if (!Buffer || BufferSize < sizeof(MIB_TCPROW))
+        return TDI_INVALID_PARAMETER;
+    if (Row->dwState != MIB_TCP_STATE_DELETE_TCB)
+        return TDI_INVALID_PARAMETER;
+
+    LockObject(AddrFile);
+    Connection = AddrFile->Connection;
+    if (Connection)
+        ReferenceObject(Connection);
+    UnlockObject(AddrFile);
+
+    if (!Connection)
+        return TDI_INVALID_REQUEST;
+
+    if (Connection->SocketContext &&
+        NT_SUCCESS(TCPGetSockAddress(Connection, (PTRANSPORT_ADDRESS)&Local, sizeof(Local), FALSE)) &&
+        NT_SUCCESS(TCPGetSockAddress(Connection, (PTRANSPORT_ADDRESS)&Remote, sizeof(Remote), TRUE)) &&
+        Local.Address[0].AddressType == TDI_ADDRESS_TYPE_IP &&
+        Remote.Address[0].AddressType == TDI_ADDRESS_TYPE_IP &&
+        Local.Address[0].Address[0].in_addr == Row->dwLocalAddr &&
+        Local.Address[0].Address[0].sin_port == (USHORT)Row->dwLocalPort &&
+        Remote.Address[0].Address[0].in_addr == Row->dwRemoteAddr &&
+        Remote.Address[0].Address[0].sin_port == (USHORT)Row->dwRemotePort)
+    {
+        TCPDisconnect(Connection, TDI_DISCONNECT_ABORT, NULL, NULL, NULL, NULL, NULL);
+        Status = TDI_SUCCESS;
+    }
+
+    DereferenceObject(Connection);
     return Status;
 }
 
@@ -371,4 +403,191 @@ TDI_STATUS InfoTdiSetRoute(PIP_INTERFACE IF, PVOID Buffer, UINT BufferSize)
      }
 
      return TDI_INVALID_REQUEST;
+}
+
+static
+VOID
+InfoIp6CopyAddress(PCHAR TransportBuffer, PUCHAR Address, PUSHORT Port)
+{
+    PTA_IP6_ADDRESS Ta6 = (PTA_IP6_ADDRESS)TransportBuffer;
+
+    RtlCopyMemory(Address, Ta6->Address[0].Address[0].sin6_addr, 16);
+    *Port = Ta6->Address[0].Address[0].sin6_port;
+}
+
+static
+NTSTATUS
+InfoIp6QueryEndpoints(PUCHAR Buffer, ULONG Length, PULONG Count, PULONG Needed, PIP6_STATISTICS Stats)
+{
+    PADDRESS_FILE *Files;
+    PLIST_ENTRY Entry;
+    ULONG Total = 0, Taken = 0, i;
+    KIRQL OldIrql;
+
+    TcpipAcquireSpinLock(&AddressFileListLock, &OldIrql);
+    for (Entry = AddressFileListHead.Flink; Entry != &AddressFileListHead; Entry = Entry->Flink)
+    {
+        PADDRESS_FILE AddrFile = CONTAINING_RECORD(Entry, ADDRESS_FILE, ListEntry);
+
+        if (AddrFile->Address.Type == IP_ADDRESS_V6 &&
+            (AddrFile->Protocol == IPPROTO_TCP || AddrFile->Protocol == IPPROTO_UDP))
+            Total++;
+    }
+    TcpipReleaseSpinLock(&AddressFileListLock, OldIrql);
+
+    Files = ExAllocatePoolWithTag(NonPagedPool, max(Total, 1) * sizeof(PADDRESS_FILE), ADDR_FILE_TAG);
+    if (!Files)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    TcpipAcquireSpinLock(&AddressFileListLock, &OldIrql);
+    for (Entry = AddressFileListHead.Flink; Entry != &AddressFileListHead && Taken < Total; Entry = Entry->Flink)
+    {
+        PADDRESS_FILE AddrFile = CONTAINING_RECORD(Entry, ADDRESS_FILE, ListEntry);
+
+        if (AddrFile->Address.Type == IP_ADDRESS_V6 &&
+            (AddrFile->Protocol == IPPROTO_TCP || AddrFile->Protocol == IPPROTO_UDP))
+        {
+            ReferenceObject(AddrFile);
+            Files[Taken++] = AddrFile;
+        }
+    }
+    TcpipReleaseSpinLock(&AddressFileListLock, OldIrql);
+
+    for (i = 0; i < Taken; i++)
+    {
+        PADDRESS_FILE AddrFile = Files[i];
+        IP6_ENDPOINT_ROW Row;
+        BOOLEAN Emit = TRUE;
+
+        RtlZeroMemory(&Row, sizeof(Row));
+        Row.Protocol = AddrFile->Protocol;
+        RtlCopyMemory(Row.LocalAddress, AddrFile->Address.Address.IPv6Address, sizeof(Row.LocalAddress));
+        Row.LocalPort = AddrFile->Port;
+        Row.ProcessId = HandleToUlong(AddrFile->ProcessId);
+        Row.CreateTime = AddrFile->CreationTime;
+        Row.ModuleInfo = (ULONG_PTR)AddrFile->SubProcessTag;
+
+        if (AddrFile->Protocol == IPPROTO_TCP)
+        {
+            if (AddrFile->Listener)
+            {
+                Row.State = MIB_TCP_STATE_LISTEN;
+            }
+            else if (AddrFile->Connection && AddrFile->Connection->SocketContext)
+            {
+                CHAR Local[sizeof(TA_IP6_ADDRESS)], Remote[sizeof(TA_IP6_ADDRESS)];
+
+                if (NT_SUCCESS(TCPGetSockAddress(AddrFile->Connection, (PTRANSPORT_ADDRESS)Local, sizeof(Local), FALSE)) &&
+                    NT_SUCCESS(TCPGetSockAddress(AddrFile->Connection, (PTRANSPORT_ADDRESS)Remote, sizeof(Remote), TRUE)) &&
+                    ((PTA_IP6_ADDRESS)Local)->Address[0].AddressType == TDI_ADDRESS_TYPE_IP6 &&
+                    NT_SUCCESS(TCPGetSocketStatus(AddrFile->Connection, &Row.State)))
+                {
+                    InfoIp6CopyAddress(Local, Row.LocalAddress, &Row.LocalPort);
+                    InfoIp6CopyAddress(Remote, Row.RemoteAddress, &Row.RemotePort);
+                }
+                else
+                {
+                    Emit = FALSE;
+                }
+            }
+            else
+            {
+                Emit = FALSE;
+            }
+        }
+
+        if (Emit)
+        {
+            if (Stats)
+            {
+                if (Row.Protocol == IPPROTO_UDP)
+                {
+                    Stats->UdpNumAddresses++;
+                }
+                else
+                {
+                    Stats->TcpNumConnections++;
+                    if (Row.State == MIB_TCP_STATE_ESTAB || Row.State == MIB_TCP_STATE_CLOSE_WAIT)
+                        Stats->TcpCurrentEstablished++;
+                }
+            }
+            else
+            {
+                ULONG Offset = *Needed;
+
+                if (Buffer && Offset + sizeof(Row) <= Length)
+                    RtlCopyMemory(Buffer + Offset, &Row, sizeof(Row));
+                *Needed += sizeof(Row);
+                (*Count)++;
+            }
+        }
+
+        DereferenceObject(AddrFile);
+    }
+
+    ExFreePoolWithTag(Files, ADDR_FILE_TAG);
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS
+InfoIp6QueryTable(ULONG TableId, PVOID Buffer, ULONG Length, PULONG Information)
+{
+    PIP6_TABLE_HEADER Header = Buffer;
+    ULONG Count = 0, Needed = sizeof(IP6_TABLE_HEADER);
+    NTSTATUS Status;
+
+    *Information = 0;
+    if (Length < sizeof(IP6_TABLE_HEADER))
+        return STATUS_BUFFER_TOO_SMALL;
+
+    switch (TableId)
+    {
+    case Ip6TableInterfaces:
+    case Ip6TableAddresses:
+    case Ip6TableRoutes:
+    case Ip6TableNeighbors:
+        Status = LibIP6QueryTable(TableId, Buffer, Length, &Count, &Needed, NULL);
+        break;
+
+    case Ip6TableStatistics:
+    {
+        IP6_STATISTICS Stats;
+        ULONG Ignored, IgnoredNeeded;
+
+        RtlZeroMemory(&Stats, sizeof(Stats));
+        Status = LibIP6QueryTable(Ip6TableStatistics, NULL, 0, &Ignored, &IgnoredNeeded, &Stats);
+        if (NT_SUCCESS(Status))
+            Status = InfoIp6QueryEndpoints(NULL, 0, &Ignored, &IgnoredNeeded, &Stats);
+        if (NT_SUCCESS(Status))
+        {
+            Count = 1;
+            Needed = sizeof(IP6_TABLE_HEADER) + sizeof(Stats);
+            if (Needed <= Length)
+                RtlCopyMemory(Header + 1, &Stats, sizeof(Stats));
+        }
+        break;
+    }
+
+    case Ip6TableEndpoints:
+        Status = InfoIp6QueryEndpoints(Buffer, Length, &Count, &Needed, NULL);
+        break;
+
+    default:
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (!NT_SUCCESS(Status))
+        return Status;
+
+    Header->Count = Count;
+    Header->Needed = Needed;
+
+    if (Needed > Length)
+    {
+        *Information = sizeof(IP6_TABLE_HEADER);
+        return STATUS_BUFFER_OVERFLOW;
+    }
+
+    *Information = Needed;
+    return STATUS_SUCCESS;
 }

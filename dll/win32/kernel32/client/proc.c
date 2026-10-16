@@ -74,7 +74,7 @@ StuffStdHandle(IN HANDLE ProcessHandle,
                                0,
                                DUPLICATE_SAME_ACCESS |
                                DUPLICATE_SAME_ATTRIBUTES);
-    if (!NT_SUCCESS(Status)) return;
+    if (!NT_SUCCESS(Status)) DuplicatedHandle = NULL;
 
     /* Write it */
     NtWriteVirtualMemory(ProcessHandle,
@@ -1416,6 +1416,11 @@ FlushInstructionCache(IN HANDLE hProcess,
                       IN SIZE_T nSize)
 {
     NTSTATUS Status;
+    PVOID WorkList;
+
+    WorkList = BasepOpenEmulatorWork(hProcess);
+    BasepPostEmulatorWork(WorkList, CrossProcessFlushCache, (PVOID)lpBaseAddress, nSize, 0, 0, 0);
+    BasepCloseEmulatorWork(WorkList);
 
     /* Call the native function */
     Status = NtFlushInstructionCache(hProcess, (PVOID)lpBaseAddress, nSize);
@@ -2144,9 +2149,12 @@ WriteProcessMemory(IN HANDLE hProcess,
     ULONG OldProtect, Protect;
     SIZE_T RegionSize;
     PVOID Base;
+    PVOID WorkList;
 
     if (!VirtualQueryEx(hProcess, lpBaseAddress, &Info, sizeof(Info)))
         return FALSE;
+
+    WorkList = BasepOpenEmulatorWork(hProcess);
 
     switch (Info.Protect & ~(PAGE_GUARD | PAGE_NOCACHE))
     {
@@ -2157,8 +2165,8 @@ WriteProcessMemory(IN HANDLE hProcess,
         Status = NtWriteVirtualMemory(hProcess, lpBaseAddress, (PVOID)lpBuffer, nSize, lpNumberOfBytesWritten);
         if (NT_SUCCESS(Status))
         {
+            BasepPostEmulatorWork(WorkList, CrossProcessFlushCache, lpBaseAddress, nSize, 0, 0, 0);
             NtFlushInstructionCache(hProcess, lpBaseAddress, nSize);
-            return TRUE;
         }
         break;
 
@@ -2167,13 +2175,21 @@ WriteProcessMemory(IN HANDLE hProcess,
         Base = (PVOID)((ULONG_PTR)lpBaseAddress & ~((ULONG_PTR)PAGE_SIZE - 1));
         RegionSize = (((ULONG_PTR)lpBaseAddress + nSize + PAGE_SIZE - 1) & ~((ULONG_PTR)PAGE_SIZE - 1)) - (ULONG_PTR)Base;
         RegionSize = min(RegionSize, (SIZE_T)((ULONG_PTR)Info.BaseAddress + Info.RegionSize - (ULONG_PTR)Base));
-        Protect = (Info.Type == MEM_PRIVATE) ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_WRITECOPY;
+        Protect = PAGE_TARGETS_NO_UPDATE | PAGE_ENCLAVE_UNVALIDATED |
+                  ((Info.Type == MEM_PRIVATE) ? PAGE_EXECUTE_READWRITE : PAGE_EXECUTE_WRITECOPY);
+        BasepPostEmulatorWork(WorkList, CrossProcessPreVirtualProtect, Base, RegionSize, 1, Protect, 0);
         Status = NtProtectVirtualMemory(hProcess, &Base, &RegionSize, Protect, &OldProtect);
+        BasepPostEmulatorWork(WorkList, CrossProcessPostVirtualProtect, Base, RegionSize, 2, Protect, Status);
         if (!NT_SUCCESS(Status))
             break;
         Status = NtWriteVirtualMemory(hProcess, lpBaseAddress, (PVOID)lpBuffer, nSize, lpNumberOfBytesWritten);
+        if (NT_SUCCESS(Status))
+            BasepPostEmulatorWork(WorkList, CrossProcessFlushCache, lpBaseAddress, nSize, 0, 0, 0);
         NtFlushInstructionCache(hProcess, lpBaseAddress, nSize);
-        Status2 = NtProtectVirtualMemory(hProcess, &Base, &RegionSize, OldProtect, &Protect);
+        Protect = PAGE_TARGETS_NO_UPDATE | PAGE_ENCLAVE_UNVALIDATED | OldProtect;
+        BasepPostEmulatorWork(WorkList, CrossProcessPreVirtualProtect, Base, RegionSize, 1, Protect, 0);
+        Status2 = NtProtectVirtualMemory(hProcess, &Base, &RegionSize, Protect, &OldProtect);
+        BasepPostEmulatorWork(WorkList, CrossProcessPostVirtualProtect, Base, RegionSize, 2, Protect, Status2);
         if (NT_SUCCESS(Status))
             Status = Status2;
         break;
@@ -2182,6 +2198,8 @@ WriteProcessMemory(IN HANDLE hProcess,
         Status = STATUS_ACCESS_VIOLATION;
         break;
     }
+
+    BasepCloseEmulatorWork(WorkList);
 
     if (!NT_SUCCESS(Status))
     {
@@ -2848,6 +2866,7 @@ BasepCreateUserProcess(IN HANDLE UserToken,
     PIMAGE_NT_HEADERS NtHeaders;
     ULONG AttributeCount = 0, ProcessFlags = InitialProcessFlags, ResumeCount;
     ULONG HardErrorMode, Length;
+    PROCESS_SESSION_INFORMATION SessionInfo;
     NTSTATUS Status;
     PS_BNO_ISOLATION_PARAMETERS BnoIsolation;
     ULONG BnoPrefixLength;
@@ -3140,9 +3159,14 @@ BasepCreateUserProcess(IN HANDLE UserToken,
     if (NtHeaders && NtHeaders->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_GUI) AddToHandle(CreateProcessMessage->ProcessHandle, 1);
     if (StartupInfo->dwFlags & STARTF_FORCEONFEEDBACK) AddToHandle(CreateProcessMessage->ProcessHandle, 1);
     if (StartupInfo->dwFlags & STARTF_FORCEOFFFEEDBACK) RemoveFromHandle(CreateProcessMessage->ProcessHandle, 1);
-    Status = CsrClientCallServer((PCSR_API_MESSAGE)&CsrMessage, NULL, CSR_CREATE_API_NUMBER(BASESRV_SERVERDLL_INDEX, BasepCreateProcess), sizeof(*CreateProcessMessage));
-    if (NT_SUCCESS(Status)) Status = CsrMessage.Status;
-    if (!NT_SUCCESS(Status)) goto Failure;
+    if (!UserToken ||
+        !NT_SUCCESS(NtQueryInformationProcess(ProcessHandle, ProcessSessionInformation, &SessionInfo, sizeof(SessionInfo), NULL)) ||
+        SessionInfo.SessionId == NtCurrentPeb()->SessionId)
+    {
+        Status = CsrClientCallServer((PCSR_API_MESSAGE)&CsrMessage, NULL, CSR_CREATE_API_NUMBER(BASESRV_SERVERDLL_INDEX, BasepCreateProcess), sizeof(*CreateProcessMessage));
+        if (NT_SUCCESS(Status)) Status = CsrMessage.Status;
+        if (!NT_SUCCESS(Status)) goto Failure;
+    }
 
     for (JobIndex = 0; JobIndex < Extended->JobCount; JobIndex++)
     {
@@ -5121,8 +5145,7 @@ StartScan:
         !(StartupInfo.dwFlags & STARTF_USESTDHANDLES) &&
         !(dwCreationFlags & (CREATE_NO_WINDOW |
                              CREATE_NEW_CONSOLE |
-                             DETACHED_PROCESS)) &&
-        (ImageInformation.SubSystemType == IMAGE_SUBSYSTEM_WINDOWS_CUI))
+                             DETACHED_PROCESS)))
     {
         /* Get the remote parameters */
         Status = NtReadVirtualMemory(ProcessHandle,
@@ -5130,7 +5153,8 @@ StartScan:
                                      &ProcessParameters,
                                      sizeof(PRTL_USER_PROCESS_PARAMETERS),
                                      NULL);
-        if (NT_SUCCESS(Status))
+        if (NT_SUCCESS(Status) &&
+            (ImageInformation.SubSystemType == IMAGE_SUBSYSTEM_WINDOWS_CUI))
         {
             StuffStdHandle(ProcessHandle,
                            Peb->ProcessParameters->StandardInput,
@@ -5141,6 +5165,17 @@ StartScan:
             StuffStdHandle(ProcessHandle,
                            Peb->ProcessParameters->StandardError,
                            &ProcessParameters->StandardError);
+        }
+        else if (NT_SUCCESS(Status) &&
+                 !(StartupInfo.dwFlags & (STARTF_USEHOTKEY | STARTF_SHELLPRIVATE)))
+        {
+            HANDLE NullHandles[3] = { NULL, NULL, NULL };
+
+            NtWriteVirtualMemory(ProcessHandle,
+                                 &ProcessParameters->StandardInput,
+                                 NullHandles,
+                                 sizeof(NullHandles),
+                                 NULL);
         }
     }
 

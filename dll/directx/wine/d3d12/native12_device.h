@@ -8,8 +8,10 @@
 #pragma once
 
 class Native12DescriptorHeap;
+class Native12PipelineState;
 
-class Native12Device final : public ID3D12Device5, public Native12Allocation
+class Native12Device final : public ID3D12Device14, public ID3D12DeviceRemovedExtendedData2,
+        public ID3D12DeviceConfiguration1, public Native12Allocation
 {
 public:
     LONG references = 1;
@@ -50,6 +52,10 @@ public:
     NATIVE12_DEVICE_FUNCS functions = {};
     NATIVE12_QUEUE_FUNCS queue_functions = {};
     NATIVE12_LIST_FUNCS list_functions = {};
+    NATIVE12_LIST_FUNCS *list_tables = NULL;
+    UINT list_table_count = 0;
+    HRESULT FillListTables(SIZE_T list_table_size);
+    const NATIVE12_LIST_FUNCS *FindListTable(HANDLE table);
     D3DDDICB_CREATEPAGINGQUEUE paging_queue = {};
     D3D_FEATURE_LEVEL feature_level = D3D_FEATURE_LEVEL_11_0;
     UINT ddi_build = NATIVE12_DDI_BUILD;
@@ -57,10 +63,14 @@ public:
     D3D12DDI_SHADER_CAPS_0084 shader_caps = {};
     D3D12DDI_ARCHITECTURE_INFO_DATA architecture = {};
     D3D12DDI_MEMORY_ARCHITECTURE_CAPS_0041 memory = {};
-    HRESULT ValidateHeapProperties(const D3D12_HEAP_PROPERTIES *properties);
+    D3D12DDI_OPTIONS_DATA_0098 gpu_upload = {};
+    HRESULT ValidateHeapProperties(const D3D12_HEAP_PROPERTIES *properties, D3D12_HEAP_FLAGS flags);
     D3D12DDI_GPUVA_CAPS_0004 gpuva = {};
     UINT highest_shader_model = D3D_SHADER_MODEL_5_1;
     HRESULT removed_reason = S_OK;
+    D3D12_DRED_ENABLEMENT dred_auto_breadcrumbs = D3D12_DRED_ENABLEMENT_SYSTEM_CONTROLLED;
+    D3D12_DRED_ENABLEMENT dred_page_fault = D3D12_DRED_ENABLEMENT_SYSTEM_CONTROLLED;
+    UINT configuration_flags = 0;
     LONG64 resource_sequence = 0;
     LONG64 list_sequence = 0;
     Native12PrivateData private_data;
@@ -142,6 +152,7 @@ public:
     HRESULT STDMETHODCALLTYPE SetResidencyPriority(UINT, ID3D12Pageable *const *,
             const D3D12_RESIDENCY_PRIORITY *) override;
     HRESULT STDMETHODCALLTYPE CreatePipelineState(const D3D12_PIPELINE_STATE_STREAM_DESC *, REFIID, void **) override;
+    HRESULT InitializePipelineState(Native12PipelineState *pipeline, const D3D12_PIPELINE_STATE_STREAM_DESC *desc);
     HRESULT STDMETHODCALLTYPE OpenExistingHeapFromAddress(const void *, REFIID, void **) override;
     HRESULT STDMETHODCALLTYPE OpenExistingHeapFromFileMapping(HANDLE, REFIID, void **) override;
     HRESULT STDMETHODCALLTYPE EnqueueMakeResident(D3D12_RESIDENCY_FLAGS, UINT, ID3D12Pageable *const *,
@@ -171,6 +182,57 @@ public:
             D3D12_RAYTRACING_ACCELERATION_STRUCTURE_PREBUILD_INFO *) override;
     D3D12_DRIVER_MATCHING_IDENTIFIER_STATUS STDMETHODCALLTYPE CheckDriverMatchingIdentifier(D3D12_SERIALIZED_DATA_TYPE,
             const D3D12_SERIALIZED_DATA_DRIVER_MATCHING_IDENTIFIER *) override;
+    HRESULT STDMETHODCALLTYPE SetBackgroundProcessingMode(D3D12_BACKGROUND_PROCESSING_MODE, D3D12_MEASUREMENTS_ACTION,
+            HANDLE, BOOL *) override;
+    HRESULT STDMETHODCALLTYPE AddToStateObject(const D3D12_STATE_OBJECT_DESC *, ID3D12StateObject *, REFIID,
+            void **) override;
+    HRESULT STDMETHODCALLTYPE CreateProtectedResourceSession1(const D3D12_PROTECTED_RESOURCE_SESSION_DESC1 *, REFIID,
+            void **) override;
+    D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE GetResourceAllocationInfo2(D3D12_RESOURCE_ALLOCATION_INFO *,
+            UINT, UINT, const D3D12_RESOURCE_DESC1 *, D3D12_RESOURCE_ALLOCATION_INFO1 *) override;
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource2(const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS,
+            const D3D12_RESOURCE_DESC1 *, D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *,
+            ID3D12ProtectedResourceSession *, REFIID, void **) override;
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource1(ID3D12Heap *, UINT64, const D3D12_RESOURCE_DESC1 *,
+            D3D12_RESOURCE_STATES, const D3D12_CLEAR_VALUE *, REFIID, void **) override;
+    void STDMETHODCALLTYPE CreateSamplerFeedbackUnorderedAccessView(ID3D12Resource *, ID3D12Resource *,
+            D3D12_CPU_DESCRIPTOR_HANDLE) override;
+    void STDMETHODCALLTYPE GetCopyableFootprints1(const D3D12_RESOURCE_DESC1 *, UINT, UINT, UINT64,
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT *, UINT *, UINT64 *, UINT64 *) override;
+    HRESULT STDMETHODCALLTYPE CreateShaderCacheSession(const D3D12_SHADER_CACHE_SESSION_DESC *, REFIID, void **) override;
+    HRESULT STDMETHODCALLTYPE ShaderCacheControl(D3D12_SHADER_CACHE_KIND_FLAGS, D3D12_SHADER_CACHE_CONTROL_FLAGS) override;
+    HRESULT STDMETHODCALLTYPE CreateCommandQueue1(const D3D12_COMMAND_QUEUE_DESC *, REFIID, REFIID, void **) override;
+    HRESULT STDMETHODCALLTYPE CreateCommittedResource3(const D3D12_HEAP_PROPERTIES *, D3D12_HEAP_FLAGS,
+            const D3D12_RESOURCE_DESC1 *, D3D12_BARRIER_LAYOUT, const D3D12_CLEAR_VALUE *,
+            ID3D12ProtectedResourceSession *, UINT32, DXGI_FORMAT *, REFIID, void **) override;
+    HRESULT STDMETHODCALLTYPE CreatePlacedResource2(ID3D12Heap *, UINT64, const D3D12_RESOURCE_DESC1 *,
+            D3D12_BARRIER_LAYOUT, const D3D12_CLEAR_VALUE *, UINT32, DXGI_FORMAT *, REFIID, void **) override;
+    HRESULT STDMETHODCALLTYPE CreateReservedResource2(const D3D12_RESOURCE_DESC *, D3D12_BARRIER_LAYOUT,
+            const D3D12_CLEAR_VALUE *, ID3D12ProtectedResourceSession *, UINT32, DXGI_FORMAT *, REFIID,
+            void **) override;
+    void STDMETHODCALLTYPE CreateSampler2(const D3D12_SAMPLER_DESC2 *, D3D12_CPU_DESCRIPTOR_HANDLE) override;
+    D3D12_RESOURCE_ALLOCATION_INFO *STDMETHODCALLTYPE GetResourceAllocationInfo3(D3D12_RESOURCE_ALLOCATION_INFO *,
+            UINT, UINT, const D3D12_RESOURCE_DESC1 *, const UINT32 *, const DXGI_FORMAT *const *,
+            D3D12_RESOURCE_ALLOCATION_INFO1 *) override;
+    HRESULT STDMETHODCALLTYPE OpenExistingHeapFromAddress1(const void *, SIZE_T, REFIID, void **) override;
+    HRESULT STDMETHODCALLTYPE CreateRootSignatureFromSubobjectInLibrary(UINT, const void *, SIZE_T, LPCWSTR, REFIID,
+            void **) override;
+    HRESULT STDMETHODCALLTYPE GetAutoBreadcrumbsOutput(D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT *) override;
+    HRESULT STDMETHODCALLTYPE GetPageFaultAllocationOutput(D3D12_DRED_PAGE_FAULT_OUTPUT *) override;
+    HRESULT STDMETHODCALLTYPE GetAutoBreadcrumbsOutput1(D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 *) override;
+    HRESULT STDMETHODCALLTYPE GetPageFaultAllocationOutput1(D3D12_DRED_PAGE_FAULT_OUTPUT1 *) override;
+    HRESULT STDMETHODCALLTYPE GetPageFaultAllocationOutput2(D3D12_DRED_PAGE_FAULT_OUTPUT2 *) override;
+    D3D12_DRED_DEVICE_STATE STDMETHODCALLTYPE GetDeviceState() override;
+    D3D12_DEVICE_CONFIGURATION_DESC *STDMETHODCALLTYPE GetDesc(D3D12_DEVICE_CONFIGURATION_DESC *desc) override;
+    HRESULT STDMETHODCALLTYPE GetEnabledExperimentalFeatures(GUID *guids, UINT count) override;
+    HRESULT STDMETHODCALLTYPE SerializeVersionedRootSignature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC *desc,
+            ID3DBlob **blob, ID3DBlob **error) override;
+    HRESULT STDMETHODCALLTYPE CreateVersionedRootSignatureDeserializer(const void *data, SIZE_T size, REFIID iid,
+            void **out) override;
+    HRESULT STDMETHODCALLTYPE CreateVersionedRootSignatureDeserializerFromSubobjectInLibrary(const void *blob,
+            SIZE_T size, LPCWSTR name, REFIID iid, void **out) override;
+    HRESULT RefreshRemovedReason();
+    HRESULT DredStatus(D3D12_DRED_ENABLEMENT enablement);
 };
 
 Native12Device *Native12QueueDevice(HANDLE queue);

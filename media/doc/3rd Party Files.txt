@@ -54,6 +54,20 @@ License: libtiff (https://spdx.org/licenses/libtiff.html)
 URL: http://www.simplesystems.org/libtiff/
 Modifications: added .spec file
 
+Title: Public Suffix List (ICANN domains)
+Path: dll/win32/wininet/public_suffix_list.h
+Used Version: publicsuffix.org list of 2026-10-07 (ETag 7ba6fb3902bb3cd40f456e283f9182dc)
+License: MPL-2.0 (https://spdx.org/licenses/MPL-2.0.html)
+URL: https://publicsuffix.org/
+Modifications: ICANN section only, generated with sdk/tools/mkpsl.py
+
+Title: DirectX-Headers (DXCore)
+Path: sdk/include/psdk/dxcore.h
+Path: sdk/include/psdk/dxcore_interface.h
+Used Version: 461ef5138bd30922b44fbad77c4e47662812d2d5
+License: MIT (https://spdx.org/licenses/MIT.html)
+URL: https://github.com/microsoft/DirectX-Headers
+
 Title: JPEG XR reference codec
 Path: sdk/lib/3rdparty/jxr
 Used Version: Wine 11.14 libs/jxr (1012f3d99507b80d4869eabf0853567660a7ecbb)
@@ -96,6 +110,18 @@ Path: drivers/directx/powervr/fw
 Used Version: rogue_36.29.52.182_v1.fw (linux-firmware 8a58f81)
 License: Imagination Technologies binary redistribution license (drivers/directx/powervr/fw/LICENSE.powervr)
 URL: https://gitlab.freedesktop.org/imagination/linux-firmware
+
+Title: Ralink RT2870 firmware
+Path: drivers/network/dd/rt2800usb/fw
+Used Version: rt2870.bin (linux-firmware 20260319)
+License: Ralink Technology binary redistribution license (drivers/network/dd/rt2800usb/fw/LICENCE.ralink-firmware.txt)
+URL: https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git
+
+Title: Realtek RTL8852B firmware
+Path: drivers/network/dd/rtw8852bs/fw
+Used Version: rtw89/rtw8852b_fw-2.bin (linux-firmware 20260319)
+License: Realtek binary redistribution license (drivers/network/dd/rtw8852bs/fw/LICENCE.rtlwifi_firmware.txt)
+URL: https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git
 
 Title: Linux PowerVR DRM driver (drm/imagination)
 Path: drivers/directx/powervr/upstream

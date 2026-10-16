@@ -39,6 +39,10 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(dplay);
 
+#ifdef __REACTOS__
+#define DP_CONNECTION_ADDRESS_SIZE 80
+#endif
+
 /* FIXME: Should this be externed? */
 extern HRESULT DPL_CreateCompoundAddress
 ( LPCDPCOMPOUNDADDRESSELEMENT lpElements, DWORD dwElementCount,
@@ -2971,6 +2975,13 @@ static HRESULT DP_IF_EnumSessions( IDirectPlayImpl *This, DPSESSIONDESC2 *sdesc,
     if ( sdesc->dwSize != sizeof( DPSESSIONDESC2 ) )
         return DPERR_INVALIDPARAM;
 
+#ifdef __REACTOS__
+    if ( flags & ~(DPENUMSESSIONS_AVAILABLE | DPENUMSESSIONS_ALL | DPENUMSESSIONS_ASYNC |
+                   DPENUMSESSIONS_STOPASYNC | DPENUMSESSIONS_PASSWORDREQUIRED |
+                   DPENUMSESSIONS_RETURNSTATUS) )
+        return DPERR_INVALIDPARAMS;
+#endif
+
     /* Can't enumerate if the interface is already open */
     EnterCriticalSection( &This->lock );
     if ( This->dp2->bConnectionOpen )
@@ -3017,7 +3028,14 @@ static HRESULT DP_IF_EnumSessions( IDirectPlayImpl *This, DPSESSIONDESC2 *sdesc,
 
     if ( flags & DPENUMSESSIONS_STOPASYNC )
     {
+#ifdef __REACTOS__
+        BOOL running = This->dp2->hEnumSessionThread != INVALID_HANDLE_VALUE;
+#endif
         DP_KillEnumSessionThread( This );
+#ifdef __REACTOS__
+        if ( running && enumsessioncb )
+            enumsessioncb( NULL, &timeout, DPESC_TIMEDOUT, context );
+#endif
         return DP_OK;
     }
 
@@ -5104,6 +5122,11 @@ static void DP_ReadConnections( const char *searchSubKey, DWORD dwFlags,
       continue;
     }
 
+#ifdef __REACTOS__
+    if ( connection->addressSize < DP_CONNECTION_ADDRESS_SIZE )
+      connection->addressSize = DP_CONNECTION_ADDRESS_SIZE;
+#endif
+
     /* Now allocate the buffer */
     connection->address = calloc( 1, connection->addressSize );
 
@@ -5118,6 +5141,10 @@ static void DP_ReadConnections( const char *searchSubKey, DWORD dwFlags,
       free( connection );
       continue;
     }
+
+#ifdef __REACTOS__
+    *(DWORD *)((DPADDRESS *)connection->address + 1) = connection->addressSize;
+#endif
 
     list_add_tail( connections, &connection->entry );
   }
@@ -5887,6 +5914,14 @@ static HRESULT WINAPI IDirectPlay4Impl_SendEx( IDirectPlay4 *iface, DPID from, D
         LeaveCriticalSection( &This->lock );
         return DPERR_INVALIDPLAYER;
     }
+
+#ifdef __REACTOS__
+    if ( !DP_FindPlayer( This, to ) && !DP_FindAnyGroup( This, to ) )
+    {
+        LeaveCriticalSection( &This->lock );
+        return DPERR_INVALIDPARAM;
+    }
+#endif
 
     hr = DP_QueueMessage( This, from, to, from, data, DP_CopyGeneric, size );
     if ( FAILED( hr ) )

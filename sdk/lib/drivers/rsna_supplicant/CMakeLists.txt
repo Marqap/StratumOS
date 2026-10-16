@@ -7,12 +7,17 @@
 
 list(APPEND SOURCE
     rsna_sha1.c
+    rsna_sha256.c
+    rsna_p256.c
+    rsna_sae.c
     rsna_md5.c
     rsna_hmac.c
     rsna_kdf.c
     rsna_aes.c
     rsna_keywrap.c
     rsna_rc4.c
+    rsna_cmac.c
+    rsna_ccmp.c
     rsna_supplicant.c)
 
 add_library(rsna_supplicant ${SOURCE})

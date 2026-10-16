@@ -357,6 +357,16 @@ typedef struct _WLAN_CONNECTION_NOTIFICATION_DATA {
 
 /* == L2_REASON_CODE_SUCCESS */
 #define WLAN_REASON_CODE_SUCCESS              0
+#define WLAN_REASON_CODE_UNKNOWN              L2_REASON_CODE_UNKNOWN
+#define WLAN_REASON_CODE_RANGE_SIZE           L2_REASON_CODE_GROUP_SIZE
+#define WLAN_REASON_CODE_BASE                 L2_REASON_CODE_DOT11_AC_BASE
+#define WLAN_REASON_CODE_AC_BASE              L2_REASON_CODE_DOT11_AC_BASE
+#define WLAN_REASON_CODE_AC_CONNECT_BASE      (WLAN_REASON_CODE_AC_BASE + WLAN_REASON_CODE_RANGE_SIZE / 2)
+#define WLAN_REASON_CODE_MSM_BASE             L2_REASON_CODE_DOT11_MSM_BASE
+#define WLAN_REASON_CODE_MSM_CONNECT_BASE     (WLAN_REASON_CODE_MSM_BASE + WLAN_REASON_CODE_RANGE_SIZE / 2)
+#define WLAN_REASON_CODE_CONNECT_CALL_FAIL    (WLAN_REASON_CODE_AC_CONNECT_BASE + 9)
+#define WLAN_REASON_CODE_NETWORK_NOT_AVAILABLE (WLAN_REASON_CODE_AC_CONNECT_BASE + 11)
+#define WLAN_REASON_CODE_ASSOCIATION_FAILURE  (WLAN_REASON_CODE_MSM_CONNECT_BASE + 2)
 
 /* ACM notification codes (begin at L2_NOTIFICATION_CODE_PUBLIC_BEGIN == 0). */
 #if defined(__midl) || defined(__WIDL__)
@@ -427,6 +437,7 @@ DWORD WINAPI WlanConnect(IN HANDLE hClientHandle, IN const GUID *pInterfaceGuid,
 DWORD WINAPI WlanDisconnect(IN HANDLE hClientHandle, IN const GUID *pInterfaceGuid, PVOID pReserved);
 DWORD WINAPI WlanEnumInterfaces(IN HANDLE hClientHandle, PVOID pReserved, OUT PWLAN_INTERFACE_INFO_LIST *ppInterfaceList);
 DWORD WINAPI WlanGetAvailableNetworkList(IN HANDLE hClientHandle, IN const GUID *pInterfaceGuid, IN DWORD dwFlags, PVOID pReserved, OUT PWLAN_AVAILABLE_NETWORK_LIST *ppAvailableNetworkList);
+DWORD WINAPI WlanGetNetworkBssList(IN HANDLE hClientHandle, IN const GUID *pInterfaceGuid, IN const PDOT11_SSID pDot11Ssid, IN DOT11_BSS_TYPE dot11BssType, IN BOOL bSecurityEnabled, PVOID pReserved, OUT PWLAN_BSS_LIST *ppWlanBssList);
 DWORD WINAPI WlanGetInterfaceCapability(IN HANDLE hClientHandle, IN const GUID *pInterfaceGuid, PVOID pReserved, OUT PWLAN_INTERFACE_CAPABILITY *ppCapability);
 DWORD WINAPI WlanDeleteProfile(IN HANDLE hClientHandle, IN const GUID *pInterfaceGuid, IN LPCWSTR strProfileName, PVOID pReserved);
 DWORD WINAPI WlanGetProfile(IN HANDLE hClientHandle, IN const GUID *pInterfaceGuid, IN LPCWSTR strProfileName, PVOID pReserved, OUT LPWSTR *pstrProfileXml, DWORD *pdwFlags, PDWORD pdwGrantedAccess);

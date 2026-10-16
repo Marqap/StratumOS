@@ -30,6 +30,8 @@ extern void func_GetModuleFileName(void);
 extern void func_GetNumaNodeProcessorMaskEx(void);
 extern void func_GetOsSafeBootMode(void);
 extern void func_GetPackageFamilyName(void);
+extern void func_GetProcessorSystemCycleTime(void);
+extern void func_AppModelInternal(void);
 extern void func_GetSystemWow64Directory(void);
 extern void func_GetTempFileName(void);
 extern void func_GetTempPath2(void);
@@ -53,8 +55,10 @@ extern void func_LocaleNameToLCID(void);
 extern void func_lstrcpynW(void);
 extern void func_lstrlen(void);
 extern void func_MailslotRead(void);
+extern void func_MuiResources(void);
 extern void func_MultiByteToWideChar(void);
 extern void func_Pipes(void);
+extern void func_PackageNames(void);
 extern void func_PixeloramaCompat(void);
 extern void func_ProcessPreferredUILanguages(void);
 extern void func_PssSnapshot(void);
@@ -113,6 +117,8 @@ const struct test winetest_testlist[] =
     { "GetNumaNodeProcessorMaskEx",  func_GetNumaNodeProcessorMaskEx },
     { "GetOsSafeBootMode",           func_GetOsSafeBootMode },
     { "GetPackageFamilyName",        func_GetPackageFamilyName },
+    { "GetProcessorSystemCycleTime", func_GetProcessorSystemCycleTime },
+    { "AppModelInternal",            func_AppModelInternal },
     { "GetSystemWow64Directory",     func_GetSystemWow64Directory },
     { "GetTempFileName",             func_GetTempFileName },
     { "GetTempPath2",                func_GetTempPath2 },
@@ -136,8 +142,10 @@ const struct test winetest_testlist[] =
     { "lstrcpynW",                   func_lstrcpynW },
     { "lstrlen",                     func_lstrlen },
     { "MailslotRead",                func_MailslotRead },
+    { "MuiResources",                func_MuiResources },
     { "MultiByteToWideChar",         func_MultiByteToWideChar },
     { "Pipes",                       func_Pipes },
+    { "PackageNames",                func_PackageNames },
     { "PixeloramaCompat",            func_PixeloramaCompat },
     { "ProcessPreferredUILanguages", func_ProcessPreferredUILanguages },
     { "PssSnapshot",                 func_PssSnapshot },

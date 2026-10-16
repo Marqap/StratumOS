@@ -12,6 +12,7 @@ list(APPEND SOURCE
     network/arp.c
     network/checksum.c
     network/icmp.c
+    network/igmp.c
     network/interface.c
     network/ip.c
     network/loopback.c
@@ -30,6 +31,7 @@ list(APPEND SOURCE
     transport/udp/udp.c)
 
 add_library(ip OBJECT ${SOURCE} ${ip_asm})
+add_dependencies(ip bugcodes xdk)
 
 target_link_libraries(ip lwipcore)
 add_importlibs(lwipcore ntoskrnl)

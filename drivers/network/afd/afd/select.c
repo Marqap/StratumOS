@@ -340,7 +340,15 @@ VOID KillSelectsForFCB( PAFD_DEVICE_EXTENSION DeviceExt,
                                     HandleArray[i].Handle, FileObject));
             if( (PVOID)HandleArray[i].Handle == FileObject &&
                 (!OnlyExclusive || (OnlyExclusive && Poll->Exclusive)) ) {
-                SignalSocket(Poll, NULL, PollReq, STATUS_CANCELLED, FALSE);
+                if (OnlyExclusive)
+                {
+                    SignalSocket(Poll, NULL, PollReq, STATUS_CANCELLED, FALSE);
+                }
+                else
+                {
+                    PollReq->Handles[i].Status |= AFD_EVENT_CLOSE;
+                    SignalSocket(Poll, NULL, PollReq, STATUS_SUCCESS, FALSE);
+                }
                 break;
             }
         }
@@ -378,7 +386,7 @@ AfdSelect( PDEVICE_OBJECT DeviceObject, PIRP Irp,
                             (INT)(PollReq->Timeout.QuadPart)));
 
     SET_AFD_HANDLES(PollReq,
-                    LockHandles( PollReq->Handles, PollReq->HandleCount ));
+                    LockHandles( PollReq->Handles, PollReq->HandleCount, DeviceObject ));
 
     if( !AFD_HANDLES(PollReq) ) {
         Irp->IoStatus.Status = STATUS_NO_MEMORY;
@@ -579,6 +587,8 @@ AfdEnumEvents( PDEVICE_OBJECT DeviceObject, PIRP Irp,
 
     /* Copy the poll state, masking out disabled events */
     EnumReq->PollEvents = (FCB->PollState & ~FCB->EventSelectDisabled);
+    if (FCB->EventSelect)
+        EnumReq->PollEvents &= FCB->EventSelectTriggers;
     RtlCopyMemory( EnumReq->EventStatus,
                    FCB->PollStatus,
                    sizeof(EnumReq->EventStatus) );

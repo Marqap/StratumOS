@@ -35,7 +35,7 @@ static HRESULT Native12AddRegisterRange(Native12RegisterRange *ranges, UINT capa
     return S_OK;
 }
 
-static HRESULT Native12ValidateRootSignature(const D3D12_ROOT_SIGNATURE_DESC1 *desc)
+static HRESULT Native12ValidateRootSignature(const D3D12_ROOT_SIGNATURE_DESC2 *desc)
 {
     UINT capacity = desc->NumStaticSamplers, count = 0, cost = 0;
     HRESULT hr = S_OK;
@@ -136,14 +136,14 @@ HRESULT Native12RootSignature::Initialize(const void *bytecode, SIZE_T length)
     HRESULT hr = D3D12CreateVersionedRootSignatureDeserializer(bytecode, length,
             IID_ID3D12VersionedRootSignatureDeserializer, reinterpret_cast<void **>(&deserializer));
     if (FAILED(hr)) return hr;
-    hr = deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_1, &versioned);
+    hr = deserializer->GetRootSignatureDescAtVersion(D3D_ROOT_SIGNATURE_VERSION_1_2, &versioned);
     if (FAILED(hr) || !versioned)
     {
         deserializer->Release();
         return FAILED(hr) ? hr : E_FAIL;
     }
 
-    const D3D12_ROOT_SIGNATURE_DESC1 *source = &versioned->Desc_1_1;
+    const D3D12_ROOT_SIGNATURE_DESC2 *source = &versioned->Desc_1_2;
     if (FAILED(hr = Native12ValidateRootSignature(source)))
     {
         deserializer->Release();
@@ -203,7 +203,7 @@ HRESULT Native12RootSignature::Initialize(const void *bytecode, SIZE_T length)
         }
         for (UINT i = 0; i < source->NumStaticSamplers; ++i)
         {
-            const D3D12_STATIC_SAMPLER_DESC &input = source->pStaticSamplers[i];
+            const D3D12_STATIC_SAMPLER_DESC1 &input = source->pStaticSamplers[i];
             samplers[i].Filter = static_cast<D3D12DDI_FILTER>(input.Filter);
             samplers[i].AddressU = static_cast<D3D12DDI_TEXTURE_ADDRESS_MODE>(input.AddressU);
             samplers[i].AddressV = static_cast<D3D12DDI_TEXTURE_ADDRESS_MODE>(input.AddressV);
@@ -217,6 +217,7 @@ HRESULT Native12RootSignature::Initialize(const void *bytecode, SIZE_T length)
             samplers[i].ShaderRegister = input.ShaderRegister;
             samplers[i].RegisterSpace = input.RegisterSpace;
             samplers[i].ShaderVisibility = static_cast<D3D12DDI_SHADER_VISIBILITY>(input.ShaderVisibility);
+            samplers[i].Flags = static_cast<D3D12DDI_SAMPLER_FLAGS_0096>(input.Flags);
         }
     }
 
@@ -391,11 +392,137 @@ struct Native12Signature
     }
 };
 
+struct Native12DxbcConverter : public IUnknown
+{
+    virtual HRESULT STDMETHODCALLTYPE Convert(LPCVOID dxbc, UINT32 dxbc_size, LPCWSTR options, LPVOID *dxil,
+            UINT32 *dxil_size, LPWSTR *diagnostics) = 0;
+};
+
+struct Native12ConvertedShader
+{
+    Native12ConvertedShader *next;
+    UINT dxbc_size;
+    const UINT *code;
+    UINT size;
+    BYTE data[1];
+};
+
+static const UINT Native12PsvRuntimeInfo1Size = 36;
+static SRWLOCK Native12ConvertedLock = SRWLOCK_INIT;
+static Native12ConvertedShader *Native12ConvertedShaders;
+static INIT_ONCE Native12DxilconvOnce = INIT_ONCE_STATIC_INIT;
+static HRESULT (WINAPI *Native12DxilconvCreate)(REFCLSID, REFIID, void **);
+
+static BOOL CALLBACK Native12LoadDxilconv(INIT_ONCE *, void *, void **)
+{
+    HMODULE module = LoadLibraryW(L"dxilconv.dll");
+    if (module)
+        Native12DxilconvCreate = reinterpret_cast<HRESULT (WINAPI *)(REFCLSID, REFIID, void **)>(
+                GetProcAddress(module, "DxcCreateInstance"));
+    TRACE("dxilconv %p, DxcCreateInstance %p.\n", module, Native12DxilconvCreate);
+    return TRUE;
+}
+
+static const UINT *Native12FindDxilProgram(const BYTE *data, UINT size)
+{
+    if (size < 32 || Native12ReadDword(data) != 0x43425844) return NULL;
+    UINT chunks = Native12ReadDword(data + 28);
+    if (chunks > (size - 32) / 4) return NULL;
+    for (UINT i = 0; i < chunks; ++i)
+    {
+        UINT offset = Native12ReadDword(data + 32 + i * 4);
+        if (offset > size - 8) return NULL;
+        UINT tag = Native12ReadDword(data + offset), chunk_size = Native12ReadDword(data + offset + 4);
+        if (tag == 0x4c495844 && chunk_size >= 8 && chunk_size <= size - offset - 8)
+            return reinterpret_cast<const UINT *>(data + offset + 8);
+    }
+    return NULL;
+}
+
+static Native12ConvertedShader *Native12FindConvertedShader(const BYTE *dxbc, UINT dxbc_size)
+{
+    for (Native12ConvertedShader *entry = Native12ConvertedShaders; entry; entry = entry->next)
+        if (entry->dxbc_size == dxbc_size && !memcmp(entry->data, dxbc, dxbc_size)) return entry;
+    return NULL;
+}
+
 struct Native12ShaderCode
 {
     const UINT *code = NULL;
     D3D12DDI_SHADERCACHE_HASH hash = {};
     Native12Signature input, output, patch;
+    bool dxil = false;
+    UINT psv_runtime_info_size = 0;
+
+    HRESULT ConvertToDxil(UINT highest_shader_model, const D3D12_SHADER_BYTECODE &bytecode)
+    {
+        static const GUID clsid = {0x4900391e, 0xb752, 0x4edd, {0xa8, 0x85, 0x6f, 0xb7, 0x6e, 0x25, 0xad, 0xdb}};
+        static const GUID iid = {0x5f956ed5, 0x78d1, 0x4b15, {0x82, 0x47, 0xf7, 0x18, 0x76, 0x14, 0xa0, 0x41}};
+        const BYTE *dxbc = static_cast<const BYTE *>(bytecode.pShaderBytecode);
+        UINT dxbc_size = Native12ReadDword(dxbc + 24);
+        Native12DxbcConverter *converter = NULL;
+        Native12ConvertedShader *entry, *existing;
+        void *converted = NULL;
+        UINT32 converted_size = 0;
+        WCHAR *diagnostics = NULL;
+        const UINT *program;
+        HRESULT hr;
+
+        if (dxil || highest_shader_model < D3D_SHADER_MODEL_6_0) return S_OK;
+        InitOnceExecuteOnce(&Native12DxilconvOnce, Native12LoadDxilconv, NULL, NULL);
+        if (!Native12DxilconvCreate) return S_OK;
+
+        AcquireSRWLockShared(&Native12ConvertedLock);
+        entry = Native12FindConvertedShader(dxbc, dxbc_size);
+        ReleaseSRWLockShared(&Native12ConvertedLock);
+        if (entry)
+        {
+            code = entry->code;
+            return S_OK;
+        }
+
+        if (FAILED(hr = Native12DxilconvCreate(clsid, iid, reinterpret_cast<void **>(&converter)))) return hr;
+        hr = converter->Convert(bytecode.pShaderBytecode, static_cast<UINT32>(bytecode.BytecodeLength), NULL,
+                &converted, &converted_size, &diagnostics);
+        converter->Release();
+        if (FAILED(hr)) WARN("DXBC to DXIL conversion failed, hr %#lx, %s.\n", hr, debugstr_w(diagnostics));
+        if (diagnostics) CoTaskMemFree(diagnostics);
+        if (FAILED(hr)) return hr;
+
+        entry = static_cast<Native12ConvertedShader *>(HeapAlloc(GetProcessHeap(), 0,
+                FIELD_OFFSET(Native12ConvertedShader, data[dxbc_size + converted_size])));
+        if (!entry)
+        {
+            CoTaskMemFree(converted);
+            return E_OUTOFMEMORY;
+        }
+        entry->dxbc_size = dxbc_size;
+        memcpy(entry->data, dxbc, dxbc_size);
+        memcpy(entry->data + entry->dxbc_size, converted, converted_size);
+        entry->size = converted_size;
+        CoTaskMemFree(converted);
+        if (!(program = Native12FindDxilProgram(entry->data + entry->dxbc_size, entry->size)))
+        {
+            HeapFree(GetProcessHeap(), 0, entry);
+            return E_FAIL;
+        }
+        entry->code = program;
+
+        AcquireSRWLockExclusive(&Native12ConvertedLock);
+        if ((existing = Native12FindConvertedShader(dxbc, dxbc_size)))
+        {
+            HeapFree(GetProcessHeap(), 0, entry);
+            entry = existing;
+        }
+        else
+        {
+            entry->next = Native12ConvertedShaders;
+            Native12ConvertedShaders = entry;
+        }
+        ReleaseSRWLockExclusive(&Native12ConvertedLock);
+        code = entry->code;
+        return S_OK;
+    }
 
     HRESULT Parse(const D3D12_SHADER_BYTECODE &bytecode)
     {
@@ -416,11 +543,14 @@ struct Native12ShaderCode
             {
                 if (chunk_size < 8) return E_INVALIDARG;
                 code = reinterpret_cast<const UINT *>(chunk);
+                dxil = tag == 0x4c495844;
             }
             else if (tag == 0x4e475349 || tag == 0x31475349) hr = input.Read(chunk, chunk_size, tag);
             else if (tag == 0x4e47534f || tag == 0x3147534f || tag == 0x3547534f)
                 hr = output.Read(chunk, chunk_size, tag);
             else if (tag == 0x47534350 || tag == 0x31475350) hr = patch.Read(chunk, chunk_size, tag);
+            else if (tag == 0x30565350 && chunk_size >= 4 && Native12ReadDword(chunk) <= chunk_size - 4)
+                psv_runtime_info_size = Native12ReadDword(chunk);
             if (FAILED(hr)) return hr;
         }
         return code ? S_OK : E_INVALIDARG;
@@ -449,6 +579,7 @@ static HRESULT Native12CreateShader(Native12PipelineState *pipeline, Native12Sta
     if (pipeline->root_signature) args.hRootSignature = pipeline->root_signature->driver;
     args.pShaderCode = shader.code;
     args.ShaderCodeHash = shader.hash;
+    args.LibraryReference = pipeline->LibraryReference();
     if (tess)
     {
         tessellation.pInputSignature = shader.input.entries;
@@ -598,6 +729,7 @@ static HRESULT Native12CreateStreamOutputShader(Native12PipelineState *pipeline,
     args.CreateShader.pShaderCode = passthrough ? NULL : shader.code;
     if (!passthrough) args.CreateShader.ShaderCodeHash = shader.hash;
     args.CreateShader.IOSignatures.Standard = &signatures;
+    args.CreateShader.LibraryReference = pipeline->LibraryReference();
     args.pOutputStreamDecl = declaration;
     args.NumEntries = expanded;
     args.BufferStridesInBytes = strides;
@@ -665,6 +797,10 @@ HRESULT Native12PipelineState::InitializeGraphics(const D3D12_GRAPHICS_PIPELINE_
     HRESULT hr;
 
     if (input->NumRenderTargets > D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT) return E_INVALIDARG;
+    if (input->Flags & ~(D3D12_PIPELINE_STATE_FLAG_TOOL_DEBUG | D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS
+            | D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT))
+        return E_INVALIDARG;
+    flags = input->Flags;
     if (!input->VS.pShaderBytecode || !input->VS.BytecodeLength) return E_INVALIDARG;
     if ((input->HS.pShaderBytecode || input->DS.pShaderBytecode)
             && input->PrimitiveTopologyType != D3D12_PRIMITIVE_TOPOLOGY_TYPE_PATCH)
@@ -684,6 +820,7 @@ HRESULT Native12PipelineState::InitializeGraphics(const D3D12_GRAPHICS_PIPELINE_
         for (UINT i = 1; blend_input.IndependentBlendEnable && i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i)
             if (blend_input.RenderTarget[i].BlendEnable) return E_INVALIDARG;
     }
+    if (FAILED(hr = PrepareDescription(input, NULL, input->CachedPSO)) || hash_only) return hr;
 
     if (input->pRootSignature)
     {
@@ -707,6 +844,12 @@ HRESULT Native12PipelineState::InitializeGraphics(const D3D12_GRAPHICS_PIPELINE_
         if (!bytecode.pShaderBytecode || !bytecode.BytecodeLength) continue;
         Native12ShaderCode &shader = parsed[i];
         if (FAILED(hr = shader.Parse(bytecode))) return hr;
+        if (view_instance_count > 1 && shader.psv_runtime_info_size < Native12PsvRuntimeInfo1Size)
+        {
+            WARN("Stage %u has no view ID metadata for %u views.\n", i, view_instance_count);
+            return E_INVALIDARG;
+        }
+        if (FAILED(hr = shader.ConvertToDxil(device->highest_shader_model, bytecode))) return hr;
         if (stream_output && stages[i].stage == Native12StageGeometry)
             hr = Native12CreateStreamOutputShader(this, shader, false, input->StreamOutput);
         else
@@ -721,11 +864,13 @@ HRESULT Native12PipelineState::InitializeGraphics(const D3D12_GRAPHICS_PIPELINE_
     }
 
     D3D12DDI_BLEND_DESC_0010 blend_desc = {};
+    blend_desc.LibraryReference = LibraryReference();
     blend_desc.AlphaToCoverageEnable = input->BlendState.AlphaToCoverageEnable;
     blend_desc.IndependentBlendEnable = input->BlendState.IndependentBlendEnable;
     for (UINT i = 0; i < 8; ++i)
     {
-        const D3D12_RENDER_TARGET_BLEND_DESC &source = input->BlendState.RenderTarget[i];
+        const D3D12_RENDER_TARGET_BLEND_DESC &source =
+                input->BlendState.RenderTarget[input->BlendState.IndependentBlendEnable ? i : 0];
         D3D12DDI_RENDER_TARGET_BLEND_DESC &target = blend_desc.RenderTarget[i];
         target.BlendEnable = source.BlendEnable;
         target.LogicOpEnable = source.LogicOpEnable;
@@ -745,16 +890,17 @@ HRESULT Native12PipelineState::InitializeGraphics(const D3D12_GRAPHICS_PIPELINE_
     blend_created = true;
 
     D3D12DDI_RASTERIZER_DESC_0102 raster_desc = {};
+    raster_desc.LibraryReference = LibraryReference();
     raster_desc.FillMode = static_cast<D3D12DDI_FILL_MODE>(input->RasterizerState.FillMode);
     raster_desc.CullMode = static_cast<D3D12DDI_CULL_MODE>(input->RasterizerState.CullMode);
     raster_desc.FrontCounterClockwise = input->RasterizerState.FrontCounterClockwise;
-    raster_desc.DepthBias = static_cast<FLOAT>(input->RasterizerState.DepthBias);
+    raster_desc.DepthBias = float_depth_bias ? depth_bias : static_cast<FLOAT>(input->RasterizerState.DepthBias);
     raster_desc.DepthBiasClamp = input->RasterizerState.DepthBiasClamp;
     raster_desc.SlopeScaledDepthBias = input->RasterizerState.SlopeScaledDepthBias;
     raster_desc.DepthClipEnable = input->RasterizerState.DepthClipEnable;
     raster_desc.ScissorEnable = TRUE;
-    raster_desc.LineRasterizationMode = input->RasterizerState.MultisampleEnable
-            ? D3D12DDI_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE
+    raster_desc.LineRasterizationMode = line_mode_set ? static_cast<D3D12DDI_LINE_RASTERIZATION_MODE>(line_mode)
+            : input->RasterizerState.MultisampleEnable ? D3D12DDI_LINE_RASTERIZATION_MODE_QUADRILATERAL_WIDE
             : input->RasterizerState.AntialiasedLineEnable ? D3D12DDI_LINE_RASTERIZATION_MODE_ALPHA_ANTIALIASED
             : D3D12DDI_LINE_RASTERIZATION_MODE_ALIASED;
     raster_desc.ForcedSampleCount = input->RasterizerState.ForcedSampleCount;
@@ -768,6 +914,7 @@ HRESULT Native12PipelineState::InitializeGraphics(const D3D12_GRAPHICS_PIPELINE_
 
     const D3D12_DEPTH_STENCIL_DESC &depth_source = input->DepthStencilState;
     D3D12DDI_DEPTH_STENCIL_DESC_0095 depth_desc = {};
+    depth_desc.LibraryReference = LibraryReference();
     depth_desc.DepthEnable = depth_source.DepthEnable;
     depth_desc.DepthWriteMask = static_cast<D3D12DDI_DEPTH_WRITE_MASK>(depth_source.DepthWriteMask);
     depth_desc.DepthFunc = static_cast<D3D12DDI_COMPARISON_FUNC>(
@@ -777,8 +924,8 @@ HRESULT Native12PipelineState::InitializeGraphics(const D3D12_GRAPHICS_PIPELINE_
     depth_desc.BackEnable = depth_source.StencilEnable;
     depth_desc.FrontFaceStencilReadMask = depth_source.StencilReadMask;
     depth_desc.FrontFaceStencilWriteMask = depth_source.StencilWriteMask;
-    depth_desc.BackFaceStencilReadMask = depth_source.StencilReadMask;
-    depth_desc.BackFaceStencilWriteMask = depth_source.StencilWriteMask;
+    depth_desc.BackFaceStencilReadMask = face_stencil_masks ? back_stencil_read_mask : depth_source.StencilReadMask;
+    depth_desc.BackFaceStencilWriteMask = face_stencil_masks ? back_stencil_write_mask : depth_source.StencilWriteMask;
     depth_desc.DepthBoundsTestEnable = depth_bounds_test;
     const D3D12_DEPTH_STENCILOP_DESC *faces[2] = { &depth_source.FrontFace, &depth_source.BackFace };
     D3D12DDI_DEPTH_STENCILOP_DESC *targets[2] = { &depth_desc.FrontFace, &depth_desc.BackFace };
@@ -834,6 +981,7 @@ HRESULT Native12PipelineState::InitializeGraphics(const D3D12_GRAPHICS_PIPELINE_
         }
     }
     D3D12DDIARG_CREATEELEMENTLAYOUT_0010 layout_args = {};
+    layout_args.LibraryReference = LibraryReference();
     layout_args.pVertexElements = elements;
     layout_args.NumElements = element_count;
     size = device->functions.pfnCalcPrivateElementLayoutSize(device->driver_device, &layout_args);
@@ -848,6 +996,7 @@ HRESULT Native12PipelineState::InitializeGraphics(const D3D12_GRAPHICS_PIPELINE_
     if (elements) HeapFree(GetProcessHeap(), 0, elements);
 
     D3D12DDIARG_CREATE_PIPELINE_STATE_0099 args = {};
+    args.LibraryReference = LibraryReference();
     args.hVertexShader = shaders[Native12StageVertex];
     args.hPixelShader = shaders[Native12StagePixel];
     args.hDomainShader = shaders[Native12StageDomain];
@@ -867,6 +1016,15 @@ HRESULT Native12PipelineState::InitializeGraphics(const D3D12_GRAPHICS_PIPELINE_
     args.SampleDesc = input->SampleDesc;
     if (!args.SampleDesc.Count) args.SampleDesc.Count = 1;
     args.NodeMask = input->NodeMask ? input->NodeMask : 1;
+    if (view_instance_count)
+    {
+        args.ViewInstancingDesc.ViewInstanceCount = view_instance_count;
+        args.ViewInstancingDesc.pViewInstanceLocations =
+                reinterpret_cast<const D3D12DDI_VIEW_INSTANCE_LOCATION *>(view_instance_locations);
+        args.ViewInstancingDesc.Flags = static_cast<D3D12DDI_VIEW_INSTANCING_FLAGS>(view_instancing_flags);
+    }
+    args.Flags = static_cast<D3D12DDI_PIPELINE_STATE_FLAGS>(input->Flags
+            & (D3D12_PIPELINE_STATE_FLAG_DYNAMIC_DEPTH_BIAS | D3D12_PIPELINE_STATE_FLAG_DYNAMIC_INDEX_BUFFER_STRIP_CUT));
     size = device->functions.pfnCalcPrivatePipelineStateSize(device->driver_device, &args);
     driver.pDrvPrivate = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size ? size : 1);
     if (!driver.pDrvPrivate) return E_OUTOFMEMORY;
@@ -887,6 +1045,7 @@ HRESULT Native12PipelineState::InitializeCompute(const D3D12_COMPUTE_PIPELINE_ST
     HRESULT hr;
 
     compute = true;
+    if (FAILED(hr = PrepareDescription(NULL, input, input->CachedPSO)) || hash_only) return hr;
     if (input->pRootSignature)
     {
         root_signature = static_cast<Native12RootSignature *>(input->pRootSignature);
@@ -897,9 +1056,11 @@ HRESULT Native12PipelineState::InitializeCompute(const D3D12_COMPUTE_PIPELINE_ST
         return E_INVALIDARG;
     }
     if (FAILED(hr = shader.Parse(input->CS))) return hr;
+    if (FAILED(hr = shader.ConvertToDxil(device->highest_shader_model, input->CS))) return hr;
     if (FAILED(hr = Native12CreateShader(this, Native12StageCompute, shader))) return hr;
 
     D3D12DDIARG_CREATE_PIPELINE_STATE_0099 args = {};
+    args.LibraryReference = LibraryReference();
     args.hComputeShader = shaders[Native12StageCompute];
     if (root_signature) args.hRootSignature = root_signature->driver;
     args.NodeMask = input->NodeMask ? input->NodeMask : 1;
@@ -935,6 +1096,7 @@ Native12PipelineState::~Native12PipelineState()
         if (shaders[i].pDrvPrivate) HeapFree(GetProcessHeap(), 0, shaders[i].pDrvPrivate);
     }
     if (root_signature) root_signature->ReleaseInternal();
+    if (library) library->ReleaseInternal();
 }
 
 HRESULT STDMETHODCALLTYPE Native12PipelineState::QueryInterface(REFIID iid, void **out)
@@ -950,12 +1112,6 @@ HRESULT STDMETHODCALLTYPE Native12PipelineState::QueryInterface(REFIID iid, void
     }
     *out = NULL;
     return E_NOINTERFACE;
-}
-
-HRESULT STDMETHODCALLTYPE Native12PipelineState::GetCachedBlob(ID3DBlob **blob)
-{
-    if (blob) *blob = NULL;
-    return E_NOTIMPL;
 }
 
 HRESULT Native12CreateDefaultPipelineState(Native12Device *device, bool compute, ID3D12PipelineState **out)

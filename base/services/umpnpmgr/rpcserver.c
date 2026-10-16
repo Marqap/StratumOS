@@ -89,6 +89,15 @@ RpcServerThread(LPVOID lpParameter)
         return 0;
     }
 
+    Status = RpcServerUseProtseqEpW(L"ncacn_np",
+                                    20,
+                                    L"\\pipe\\wine_plugplay",
+                                    NULL);
+    if (Status == RPC_S_OK)
+        Status = RpcServerRegisterIf(plugplay_v0_0_s_ifspec, NULL, NULL);
+    if (Status != RPC_S_OK)
+        DPRINT1("Device event listener endpoint not registered (Status %lx)\n", Status);
+
     Status = RpcServerListen(1,
                              20,
                              FALSE);
@@ -97,10 +106,6 @@ RpcServerThread(LPVOID lpParameter)
         DPRINT1("RpcServerListen() failed (Status %lx)\n", Status);
         return 0;
     }
-
-    /* ROS HACK (this should never happen...) */
-    DPRINT1("*** Other devices won't be installed correctly. If something\n");
-    DPRINT1("*** doesn't work, try to reboot to get a new chance.\n");
 
     DPRINT("RpcServerThread() done\n");
 
@@ -408,7 +413,6 @@ IsValidDeviceInstanceID(
 }
 
 
-static
 BOOL
 IsRootDeviceInstanceID(
     _In_ PWSTR pszDeviceInstanceID)
@@ -692,7 +696,20 @@ __RPC_USER
 PNP_NOTIFY_HANDLE_rundown(
     PNP_NOTIFY_HANDLE pHandle)
 {
-    DPRINT1("PNP_NOTIFY_HANDLE_rundown(%p)\n", pHandle);
+    PNOTIFY_ENTRY pEntry = (PNOTIFY_ENTRY)pHandle;
+
+    DPRINT("PNP_NOTIFY_HANDLE_rundown(%p)\n", pHandle);
+
+    if (pEntry == NULL)
+        return;
+
+    RtlAcquireResourceExclusive(&NotificationListLock, TRUE);
+    RemoveEntryList(&pEntry->ListEntry);
+    RtlReleaseResource(&NotificationListLock);
+
+    if (pEntry->pszName)
+        RtlFreeHeap(RtlGetProcessHeap(), 0, pEntry->pszName);
+    RtlFreeHeap(RtlGetProcessHeap(), 0, pEntry);
 }
 
 

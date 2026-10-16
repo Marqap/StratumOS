@@ -885,6 +885,11 @@ IopQueueTargetDeviceEvent(
     _In_ PUNICODE_STRING DeviceIds);
 
 NTSTATUS
+IopQueueCustomTargetEvent(
+    _In_ PUNICODE_STRING DeviceIds,
+    _In_ PTARGET_DEVICE_CUSTOM_NOTIFICATION Notification);
+
+NTSTATUS
 IopQueueDeviceInstallEvent(
     _In_ const GUID *Guid,
     _In_ PUNICODE_STRING DeviceId);
@@ -1280,6 +1285,12 @@ IopCompleteRequest(
     IN PVOID* SystemArgument2
 );
 
+VOID
+NTAPI
+IopAbandonThreadAgnosticIrp(
+    IN PIRP Irp
+);
+
 //
 // Error Logging Routines
 //
@@ -1662,6 +1673,13 @@ VOID
 NTAPI
 IopDeleteIoCompletion(
     PVOID ObjectBody
+);
+
+VOID
+NTAPI
+IopQueueThreadAgnosticIrp(
+    IN PIRP Irp,
+    IN PFILE_OBJECT FileObject
 );
 
 VOID

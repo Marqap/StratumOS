@@ -28,6 +28,8 @@
 #define DD_TCP_DEVICE_NAME      L"\\Device\\Tcp"
 #define DD_UDP_DEVICE_NAME      L"\\Device\\Udp"
 #define DD_RAW_IP_DEVICE_NAME   L"\\Device\\RawIp"
+#define DD_TCPV6_DEVICE_NAME    L"\\Device\\Tcp6"
+#define DD_UDPV6_DEVICE_NAME    L"\\Device\\Udp6"
 
 typedef enum _SOCKET_STATE {
     SocketStateCreated,
@@ -51,8 +53,16 @@ typedef struct _SOCKET_CONTEXT {
     SOCKET_STATE SocketState;
     PQUEUED_REQUEST RequestQueue;
     BOOL DontRoute;
+    BOOL KeepAlive;
     ULONG MulticastInterface;
     ULONG MulticastTTL;
+    ULONG UnicastInterface;
+    BOOLEAN UdpNoChecksum;
+    ULONG UdpSendMsgSize;
+    ULONG UdpRecvMaxCoalescedSize;
+    ULONG RecvInfoOptions;
+    ULONG Ttl;
+    BOOLEAN DontFragment;
     BOOL V6Only;
 } SOCKET_CONTEXT, *PSOCKET_CONTEXT;
 
@@ -67,7 +77,8 @@ INT
 SendRequest(
     IN PVOID Request,
     IN DWORD RequestSize,
-    IN DWORD IOCTL);
+    IN DWORD IOCTL,
+    IN HANDLE TdiAddressObjectHandle);
 
 #endif /* __WSHTCPIP_H */
 

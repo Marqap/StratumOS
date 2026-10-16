@@ -119,15 +119,27 @@ typedef struct _ADDRESS_FILE {
     USHORT Protocol;                      /* Protocol number */
     USHORT Port;                          /* Network port (network byte order) */
     LONG Sharers;                         /* Number of file objects with this addr file */
+    BOOLEAN Reuse;
+    BOOLEAN Exclusive;
+    BOOLEAN DualStack;
     UCHAR TTL;                            /* Time to live stored in packets sent from this address file */
     UINT DF;                              /* Don't fragment */
     UINT BCast;                           /* Receive broadcast packets */
     UINT HeaderIncl;                      /* Include header in RawIP packets */
     ULONG MulticastInterface;             /* IPv4 address or network-order interface index */
     UCHAR MulticastTTL;
+    ULONG UnicastInterface;
+    BOOLEAN NoChecksum;
+    ULONG SendMsgSize;
+    BOOLEAN RecvPktInfo;
+    BOOLEAN RecvTtl;
+    BOOLEAN RecvTos;
+    BOOLEAN RecvEcn;
+    BOOLEAN RecvDstAddr;
     DATAGRAM_COMPLETION_ROUTINE Complete; /* Completion routine for delete request */
     PVOID Context;                        /* Delete request context */
     DATAGRAM_SEND_ROUTINE Send;           /* Routine to send a datagram */
+    PVOID UdpPcb;
     LIST_ENTRY ReceiveQueue;              /* List of outstanding receive requests */
     LIST_ENTRY TransmitQueue;             /* List of outstanding transmit requests */
     struct _CONNECTION_ENDPOINT *Connection;

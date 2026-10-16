@@ -14,6 +14,7 @@
 #include <ntifs.h>
 #include <ndk/obtypes.h>
 #include <tdi.h>
+#include <tdikrnl.h>
 #include <tcpioctl.h>
 #define _WINBASE_
 #define _WINDOWS_H
@@ -53,6 +54,7 @@
 #define TAG_AFD_SNMP_ADDRESS_INFO          'asfA'
 #define TAG_AFD_TDI_CONNECTION_INFORMATION 'cTfA'
 #define TAG_AFD_WSA_BUFFER                 'bWfA'
+#define TAG_AFD_TDI_IRP_CONTEXT            'iTfA'
 
 static __inline BOOLEAN
 AfdIs32bitIoctl(PIRP Irp)
@@ -103,13 +105,19 @@ typedef struct IPADDR_ENTRY {
 #define FUNCTION_DISCONNECT             5
 #define FUNCTION_CLOSE                  6
 #define FUNCTION_CONNECTEX              7
-#define MAX_FUNCTIONS                   8
+#define FUNCTION_RECV_OOB               8
+#define FUNCTION_ADDRESS_LIST_CHANGE    9
+#define MAX_FUNCTIONS                   10
+
+#define AFD_OOB_BUFFER_SIZE             64
 
 #define IN_FLIGHT_REQUESTS              5
 
-#define EXTRA_LOCK_BUFFERS              2 /* Number of extra buffers needed
+#define EXTRA_LOCK_BUFFERS              5 /* Number of extra buffers needed
 					   * for ancillary data on packet
 					   * requests. */
+
+#define AFD_RECV_CONTROL_SIZE           256
 
 /* XXX This is a hack we should clean up later
  * We do this in order to get some storage for the locked handle table
@@ -179,6 +187,7 @@ typedef struct _AFD_DEVICE_EXTENSION {
 } AFD_DEVICE_EXTENSION, *PAFD_DEVICE_EXTENSION;
 
 extern ULONG AfdReceiveWindowSize;
+extern ULONG AfdReportedReceiveWindowSize;
 
 typedef struct _AFD_ACTIVE_POLL {
     LIST_ENTRY ListEntry;
@@ -223,6 +232,8 @@ typedef struct _AFD_STORED_DATAGRAM {
     LIST_ENTRY ListEntry;
     UINT Len;
     PTRANSPORT_ADDRESS Address;
+    PVOID Control;
+    UINT ControlLen;
     CHAR Buffer[1];
 } AFD_STORED_DATAGRAM, *PAFD_STORED_DATAGRAM;
 
@@ -231,6 +242,10 @@ typedef struct _AFD_FCB {
     BOOLEAN Locked, Critical, NonBlocking, OobInline, TdiReceiveClosed, SendClosed;
     BOOLEAN ReceiveRepostActive, ReceiveRepostPending;
     BOOLEAN SendStartActive, SendStartPending;
+    BOOLEAN CleanedUp;
+    UINT OobLength;
+    UCHAR OobData[AFD_OOB_BUFFER_SIZE];
+    UINT SendUrgentEnd;
     UINT Flags, GroupID, GroupType;
     KIRQL OldIrql;
     PVOID CurrentThread;
@@ -242,11 +257,14 @@ typedef struct _AFD_FCB {
     BOOLEAN DisconnectPending;
     LARGE_INTEGER DisconnectTimeout;
     PTRANSPORT_ADDRESS LocalAddress, RemoteAddress;
+    ULONG ConnectedSourceAddress;
     PTDI_CONNECTION_INFORMATION AddressFrom, ConnectCallInfo, ConnectReturnInfo;
+    PVOID RecvControl;
+    PVOID SendDatagramBuffer;
     AFD_TDI_OBJECT AddressFile, Connection;
     AFD_IN_FLIGHT_REQUEST ConnectIrp, ListenIrp, ReceiveIrp, SendIrp, DisconnectIrp;
     AFD_DATA_WINDOW Send, Recv;
-    UINT ReceiveWindowAllocationSize, PendingReceiveWindowSize;
+    UINT ReceiveWindowAllocationSize, PendingReceiveWindowSize, ReportedReceiveWindowSize;
     KMUTEX Mutex;
     PKEVENT TdiRundownEvent;
     PKEVENT EventSelect;
@@ -275,6 +293,7 @@ typedef struct _AFD_FCB {
     LIST_ENTRY PendingIrpList[MAX_FUNCTIONS];
     LIST_ENTRY DatagramList;
     LIST_ENTRY PendingConnections;
+    LIST_ENTRY AddressListChangeEntry;
 } AFD_FCB, *PAFD_FCB;
 
 /* bind.c */
@@ -350,6 +369,7 @@ AfdGetPeerName( PDEVICE_OBJECT DeviceObject, PIRP Irp,
 NTSTATUS AfdSuperAccept( PDEVICE_OBJECT DeviceObject, PIRP Irp,
                          PIO_STACK_LOCATION IrpSp );
 VOID AfdSuperAcceptRelease( PIRP Irp );
+VOID AfdCompleteAcceptData( PIRP Irp, NTSTATUS Status, ULONG_PTR Information );
 NTSTATUS AfdWaitForListen( PDEVICE_OBJECT DeviceObject, PIRP Irp,
 			   PIO_STACK_LOCATION IrpSp );
 
@@ -359,6 +379,9 @@ NTSTATUS AfdListenSocket(PDEVICE_OBJECT DeviceObject, PIRP Irp,
 NTSTATUS AfdAccept( PDEVICE_OBJECT DeviceObject, PIRP Irp,
 		    PIO_STACK_LOCATION IrpSp );
 
+NTSTATUS AfdDeferAccept( PDEVICE_OBJECT DeviceObject, PIRP Irp,
+                         PIO_STACK_LOCATION IrpSp );
+
 /* lock.c */
 
 PAFD_WSABUF LockBuffers( PAFD_WSABUF Buf, UINT Count,
@@ -366,6 +389,8 @@ PAFD_WSABUF LockBuffers( PAFD_WSABUF Buf, UINT Count,
                         BOOLEAN Write, BOOLEAN LockAddress,
                         KPROCESSOR_MODE LockMode, BOOLEAN Is32Bit );
 VOID UnlockBuffers( PAFD_WSABUF Buf, UINT Count, BOOL Address );
+BOOLEAN AfdIsRecvMsgRequest(PIRP Irp, PIO_STACK_LOCATION IrpSp);
+BOOLEAN AfdLockMessageBuffers(PAFD_WSABUF Buf, UINT Count, PAFD_RECV_MSG_INFO Message, KPROCESSOR_MODE LockMode);
 BOOLEAN SocketAcquireStateLock( PAFD_FCB FCB );
 NTSTATUS NTAPI UnlockAndMaybeComplete
 ( PAFD_FCB FCB, NTSTATUS Status, PIRP Irp,
@@ -373,7 +398,7 @@ NTSTATUS NTAPI UnlockAndMaybeComplete
 VOID SocketStateUnlock( PAFD_FCB FCB );
 VOID AfdSignalTdiRundown(PAFD_FCB FCB);
 NTSTATUS LostSocket( PIRP Irp );
-PAFD_HANDLE LockHandles( PAFD_HANDLE HandleArray, UINT HandleCount );
+PAFD_HANDLE LockHandles( PAFD_HANDLE HandleArray, UINT HandleCount, PDEVICE_OBJECT DeviceObject );
 VOID UnlockHandles( PAFD_HANDLE HandleArray, UINT HandleCount );
 PVOID LockRequest( PIRP Irp, PIO_STACK_LOCATION IrpSp, BOOLEAN Output, KPROCESSOR_MODE *LockMode );
 VOID UnlockRequest( PIRP Irp, PIO_STACK_LOCATION IrpSp );
@@ -388,10 +413,12 @@ VOID DestroySocket( PAFD_FCB FCB );
 DRIVER_CANCEL AfdCancelHandler;
 VOID RetryDisconnectCompletion(PAFD_FCB FCB);
 BOOLEAN CheckUnlockExtraBuffers(PAFD_FCB FCB, PIO_STACK_LOCATION IrpSp);
+VOID CleanupPendingIrp(PAFD_FCB FCB, PIRP Irp, PIO_STACK_LOCATION IrpSp, PAFD_ACTIVE_POLL Poll);
 
 /* read.c */
 
 IO_COMPLETION_ROUTINE ReceiveComplete;
+VOID AfdSatisfyAcceptData( PAFD_FCB FCB );
 
 IO_COMPLETION_ROUTINE PacketSocketRecvComplete;
 

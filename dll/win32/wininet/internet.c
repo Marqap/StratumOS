@@ -582,6 +582,55 @@ BOOL WINAPI InternetInitializeAutoProxyDll(DWORD dwReserved)
  *     FALSE on failure
  *
  */
+#ifdef __REACTOS__
+#ifndef ERROR_WINHTTP_AUTODETECTION_FAILED
+#define ERROR_WINHTTP_AUTODETECTION_FAILED (INTERNET_ERROR_BASE + 180)
+#endif
+
+static WCHAR *detect_proxy_autoconfig_url_dhcp(void);
+static WCHAR *detect_proxy_autoconfig_url_dns(void);
+
+BOOL WINAPI DetectAutoProxyUrl(LPSTR lpszAutoProxyUrl,
+	DWORD dwAutoProxyUrlLength, DWORD dwDetectFlags)
+{
+    WCHAR *url = NULL;
+    BOOL from_dns = FALSE;
+    int len;
+
+    TRACE("(%p, %lu, %lx)\n", lpszAutoProxyUrl, dwAutoProxyUrlLength, dwDetectFlags);
+
+    if (lpszAutoProxyUrl && dwAutoProxyUrlLength)
+        lpszAutoProxyUrl[0] = 0;
+
+    if (dwDetectFlags & PROXY_AUTO_DETECT_TYPE_DHCP)
+        url = detect_proxy_autoconfig_url_dhcp();
+    if (!url && (dwDetectFlags & PROXY_AUTO_DETECT_TYPE_DNS_A))
+    {
+        url = detect_proxy_autoconfig_url_dns();
+        from_dns = TRUE;
+    }
+
+    if (!url)
+    {
+        SetLastError(ERROR_WINHTTP_AUTODETECTION_FAILED);
+        return FALSE;
+    }
+
+    len = WideCharToMultiByte(CP_ACP, 0, url, -1, NULL, 0, NULL, NULL);
+    if (!lpszAutoProxyUrl || !len || (DWORD)len > dwAutoProxyUrlLength)
+    {
+        if (from_dns) GlobalFree(url);
+        else free(url);
+        SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+    WideCharToMultiByte(CP_ACP, 0, url, -1, lpszAutoProxyUrl, len, NULL, NULL);
+    if (from_dns) GlobalFree(url);
+    else free(url);
+    return TRUE;
+}
+#else
 BOOL WINAPI DetectAutoProxyUrl(LPSTR lpszAutoProxyUrl,
 	DWORD dwAutoProxyUrlLength, DWORD dwDetectFlags)
 {
@@ -589,6 +638,7 @@ BOOL WINAPI DetectAutoProxyUrl(LPSTR lpszAutoProxyUrl,
     SetLastError(ERROR_CALL_NOT_IMPLEMENTED);
     return FALSE;
 }
+#endif
 
 static void FreeProxyInfo( proxyinfo_t *lpwpi )
 {
@@ -1271,6 +1321,14 @@ static void dump_INTERNET_FLAGS(DWORD dwFlags)
  * Close internet handle
  *
  */
+#ifdef __REACTOS__
+struct synced_url
+{
+    struct list entry;
+    WCHAR url[1];
+};
+
+#endif
 static VOID APPINFO_Destroy(object_header_t *hdr)
 {
     appinfo_t *lpwai = (appinfo_t*)hdr;
@@ -1282,6 +1340,18 @@ static VOID APPINFO_Destroy(object_header_t *hdr)
     free(lpwai->proxyBypass);
     free(lpwai->proxyUsername);
     free(lpwai->proxyPassword);
+#ifdef __REACTOS__
+    if (lpwai->synced_urls.next)
+    {
+        struct synced_url *synced, *next;
+
+        LIST_FOR_EACH_ENTRY_SAFE(synced, next, &lpwai->synced_urls, struct synced_url, entry)
+        {
+            list_remove(&synced->entry);
+            free(synced);
+        }
+    }
+#endif
 }
 
 static WCHAR *copy_optionW(WCHAR *value)
@@ -1565,6 +1635,11 @@ static DWORD APPINFO_SetOption(object_header_t *hdr, DWORD option, void *buf, DW
 #endif
                     FIXME("Unhandled flags: 0x%lx\n", option->Value.dwValue);
                 global_proxy.flags = option->Value.dwValue;
+#ifdef __REACTOS__
+                if ((global_proxy.flags & (PROXY_TYPE_PROXY | PROXY_TYPE_DIRECT)) ==
+                    (PROXY_TYPE_PROXY | PROXY_TYPE_DIRECT))
+                    global_proxy.flags &= ~PROXY_TYPE_PROXY;
+#endif
                 break;
 
             case INTERNET_PER_CONN_PROXY_BYPASS:
@@ -1676,6 +1751,11 @@ HINTERNET WINAPI InternetOpenW(LPCWSTR lpszAgent, DWORD dwAccessType,
     lpwai->accessType = dwAccessType;
     lpwai->proxyUsername = NULL;
     lpwai->proxyPassword = NULL;
+#ifdef __REACTOS__
+    InitializeSRWLock(&lpwai->synced_lock);
+    list_init(&lpwai->synced_urls);
+    lpwai->preconfig = dwAccessType == INTERNET_OPEN_TYPE_PRECONFIG;
+#endif
 
 #ifdef __REACTOS__
     lpwai->agent = lpszAgent ? wcsdup(lpszAgent) : NULL;
@@ -1785,7 +1865,7 @@ BOOL WINAPI InternetGetLastResponseInfoA(LPDWORD lpdwError,
 #ifdef __REACTOS__
         DWORD len = strlen(lpwite->response);
 
-        if (lpszBuffer == NULL || *lpdwBufferLength <= len)
+        if (lpszBuffer == NULL || *lpdwBufferLength < len)
 #else
         if (lpszBuffer == NULL || *lpdwBufferLength < strlen(lpwite->response))
 #endif
@@ -1800,8 +1880,14 @@ BOOL WINAPI InternetGetLastResponseInfoA(LPDWORD lpdwError,
         }
         *lpdwError = lpwite->dwError;
 #ifdef __REACTOS__
-        memcpy(lpszBuffer, lpwite->response, len + 1);
-        *lpdwBufferLength = len;
+        if (*lpdwBufferLength)
+        {
+            DWORD copy = min(*lpdwBufferLength, len + 1);
+
+            memcpy(lpszBuffer, lpwite->response, copy);
+            lpszBuffer[copy - 1] = 0;
+            *lpdwBufferLength = strlen(lpszBuffer);
+        }
 #else
         if (*lpdwBufferLength)
         {
@@ -2281,6 +2367,17 @@ static BOOL set_url_component(WCHAR **component, DWORD *component_length, const 
     return TRUE;
 }
 
+#ifdef __REACTOS__
+static void decode_url_component(WCHAR *component, DWORD *component_length)
+{
+    if (!component || !*component_length)
+        return;
+
+    if (SUCCEEDED(UrlUnescapeW(component, NULL, NULL, URL_UNESCAPE_INPLACE)))
+        *component_length = lstrlenW(component);
+}
+
+#endif
 static BOOL set_url_component_WtoA(const WCHAR *comp_w, DWORD length, const WCHAR *url_w, char **comp, DWORD *ret_length,
                                    const char *url_a)
 {
@@ -2482,6 +2579,23 @@ BOOL WINAPI InternetCrackUrlW(const WCHAR *lpszUrl, DWORD dwUrlLength, DWORD dwF
         return FALSE;
     }
 
+#ifdef __REACTOS__
+    if ((lpUC->lpszScheme && !lpUC->dwSchemeLength) ||
+        (lpUC->lpszHostName && !lpUC->dwHostNameLength) ||
+        (lpUC->lpszUserName && !lpUC->dwUserNameLength) ||
+        (lpUC->lpszPassword && !lpUC->dwPasswordLength) ||
+        (lpUC->lpszUrlPath && !lpUC->dwUrlPathLength) ||
+        (lpUC->lpszExtraInfo && !lpUC->dwExtraInfoLength))
+    {
+        if (!lpUC->dwSchemeLength && !lpUC->dwHostNameLength && !lpUC->dwUserNameLength &&
+            !lpUC->dwPasswordLength && !lpUC->dwUrlPathLength && !lpUC->dwExtraInfoLength)
+            SetLastError(ERROR_INVALID_PARAMETER);
+        else
+            SetLastError(ERROR_INSUFFICIENT_BUFFER);
+        return FALSE;
+    }
+
+#endif
     if (!dwUrlLength)
         dwUrlLength = lstrlenW(lpszUrl);
     else {
@@ -2491,6 +2605,21 @@ BOOL WINAPI InternetCrackUrlW(const WCHAR *lpszUrl, DWORD dwUrlLength, DWORD dwF
 
     if (dwFlags & ICU_DECODE)
     {
+#ifdef __REACTOS__
+        WCHAR *buffers[6] = { lpUC->lpszScheme, lpUC->lpszHostName, lpUC->lpszUserName,
+                              lpUC->lpszPassword, lpUC->lpszUrlPath, lpUC->lpszExtraInfo };
+
+        if (!InternetCrackUrlW(lpszUrl, dwUrlLength, dwFlags & ~ICU_DECODE, lpUC))
+            return FALSE;
+
+        decode_url_component(buffers[0], &lpUC->dwSchemeLength);
+        decode_url_component(buffers[1], &lpUC->dwHostNameLength);
+        decode_url_component(buffers[2], &lpUC->dwUserNameLength);
+        decode_url_component(buffers[3], &lpUC->dwPasswordLength);
+        decode_url_component(buffers[4], &lpUC->dwUrlPathLength);
+        decode_url_component(buffers[5], &lpUC->dwExtraInfoLength);
+        return TRUE;
+#else
         WCHAR *url_tmp, *buffer;
         DWORD len = dwUrlLength + 1;
         BOOL ret;
@@ -2520,6 +2649,7 @@ BOOL WINAPI InternetCrackUrlW(const WCHAR *lpszUrl, DWORD dwUrlLength, DWORD dwF
         if (buffer != url_tmp) free(buffer);
         free(url_tmp);
         return ret;
+#endif
     }
     lpszap = lpszUrl;
     
@@ -2658,6 +2788,13 @@ BOOL WINAPI InternetCrackUrlW(const WCHAR *lpszUrl, DWORD dwUrlLength, DWORD dwF
                 }
                 else
                 {
+#ifdef __REACTOS__
+                    if (lpUC->nScheme == INTERNET_SCHEME_HTTP && lpszPort == lpszHost)
+                    {
+                        SetLastError(ERROR_INTERNET_INVALID_URL);
+                        return FALSE;
+                    }
+#endif
                     if(!set_url_component(&lpUC->lpszHostName, &lpUC->dwHostNameLength, lpszHost, lpszPort - lpszHost))
                         return FALSE;
                     if (lpszPort != lpszNetLoc)
@@ -6147,3 +6284,148 @@ DWORD WINAPI ShowClientAuthCerts(HWND parent)
     FIXME("%p: stub\n", parent);
     return 0;
 }
+
+#ifdef __REACTOS__
+static char *download_autoconfig_script(const WCHAR *url, DWORD *size)
+{
+    HINTERNET session, request;
+    char *buffer = NULL, *grown;
+    DWORD length = 0, capacity = 0, read;
+
+    if (!(session = InternetOpenW(L"", INTERNET_OPEN_TYPE_DIRECT, NULL, NULL, 0)))
+        return NULL;
+    if ((request = InternetOpenUrlW(session, url, NULL, 0, INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE, 0)))
+    {
+        for (;;)
+        {
+            if (capacity - length < 4096)
+            {
+                if (capacity >= 1024 * 1024 || !(grown = realloc(buffer, capacity + 4096 + 1)))
+                {
+                    free(buffer);
+                    buffer = NULL;
+                    break;
+                }
+                buffer = grown;
+                capacity += 4096;
+            }
+            if (!InternetReadFile(request, buffer + length, capacity - length, &read))
+            {
+                free(buffer);
+                buffer = NULL;
+                break;
+            }
+            if (!read)
+                break;
+            length += read;
+        }
+        InternetCloseHandle(request);
+    }
+    InternetCloseHandle(session);
+
+    if (!buffer)
+        return NULL;
+    buffer[length] = 0;
+    *size = length;
+    return buffer;
+}
+
+WCHAR *INTERNET_GetAutoConfigProxy(const WCHAR *url, const WCHAR *host)
+{
+    BOOL (WINAPI *init_dll)(DWORD, LPSTR, LPSTR, void *, AUTO_PROXY_SCRIPT_BUFFER *);
+    BOOL (WINAPI *get_proxy_info)(LPCSTR, DWORD, LPCSTR, DWORD, LPSTR *, LPDWORD);
+    BOOL (WINAPI *deinit_dll)(LPSTR, DWORD);
+    AUTO_PROXY_SCRIPT_BUFFER buffer = { sizeof(buffer) };
+    char *script, *url_a, *host_a, *result = NULL, *p;
+    WCHAR *autoconf = NULL, *ret = NULL;
+    DWORD size = 0, result_len = 0;
+    HMODULE module;
+    int len;
+
+    EnterCriticalSection(&WININET_cs);
+    if ((global_proxy.flags & PROXY_TYPE_AUTO_PROXY_URL) && global_proxy.autoconf_url)
+        autoconf = wcsdup(global_proxy.autoconf_url);
+    LeaveCriticalSection(&WININET_cs);
+    if (!autoconf)
+        return NULL;
+
+    script = download_autoconfig_script(autoconf, &size);
+    free(autoconf);
+    if (!script)
+        return NULL;
+
+    if ((module = LoadLibraryW(L"jsproxy.dll")))
+    {
+        init_dll = (void *)GetProcAddress(module, "InternetInitializeAutoProxyDll");
+        get_proxy_info = (void *)GetProcAddress(module, "InternetGetProxyInfo");
+        deinit_dll = (void *)GetProcAddress(module, "InternetDeInitializeAutoProxyDll");
+        url_a = strdupWtoA(url);
+        host_a = strdupWtoA(host);
+        buffer.lpszScriptBuffer = script;
+        buffer.dwScriptBufferSize = size + 1;
+        if (init_dll && get_proxy_info && deinit_dll && url_a && host_a &&
+            init_dll(0, NULL, NULL, NULL, &buffer))
+        {
+            if (get_proxy_info(url_a, strlen(url_a), host_a, strlen(host_a), &result, &result_len) && result)
+            {
+                for (p = result; *p == ' '; p++);
+                if (!_strnicmp(p, "PROXY", 5) && (p[5] == ' ' || p[5] == '\t'))
+                {
+                    for (p += 5; *p == ' ' || *p == '\t'; p++);
+                    len = strcspn(p, "; \t");
+                    if (len && (ret = malloc((len + 1) * sizeof(WCHAR))))
+                    {
+                        MultiByteToWideChar(CP_ACP, 0, p, len, ret, len);
+                        ret[len] = 0;
+                    }
+                }
+                GlobalFree(result);
+            }
+            deinit_dll(NULL, 0);
+        }
+        free(url_a);
+        free(host_a);
+        FreeLibrary(module);
+    }
+    free(script);
+    return ret;
+}
+#endif
+
+#ifdef __REACTOS__
+static struct synced_url *find_session_synced_url(appinfo_t *appinfo, const WCHAR *url)
+{
+    struct synced_url *synced;
+
+    LIST_FOR_EACH_ENTRY(synced, &appinfo->synced_urls, struct synced_url, entry)
+    {
+        if (!wcscmp(synced->url, url))
+            return synced;
+    }
+    return NULL;
+}
+
+void INTERNET_AddSessionSyncedUrl(appinfo_t *appinfo, const WCHAR *url)
+{
+    struct synced_url *synced;
+
+    AcquireSRWLockExclusive(&appinfo->synced_lock);
+    if (!find_session_synced_url(appinfo, url) &&
+        (synced = malloc(FIELD_OFFSET(struct synced_url, url[wcslen(url) + 1]))))
+    {
+        wcscpy(synced->url, url);
+        list_add_tail(&appinfo->synced_urls, &synced->entry);
+    }
+    ReleaseSRWLockExclusive(&appinfo->synced_lock);
+}
+
+BOOL INTERNET_IsSessionSyncedUrl(appinfo_t *appinfo, const WCHAR *url)
+{
+    BOOL ret;
+
+    AcquireSRWLockShared(&appinfo->synced_lock);
+    ret = find_session_synced_url(appinfo, url) != NULL;
+    ReleaseSRWLockShared(&appinfo->synced_lock);
+    return ret;
+}
+#endif

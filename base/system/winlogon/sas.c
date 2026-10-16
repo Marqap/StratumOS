@@ -666,6 +666,10 @@ HandleLogon(
     IN OUT PWLSESSION Session)
 {
     BOOL ret = FALSE;
+    ULONG SessionId = NtCurrentPeb()->SessionId;
+
+    if (!SetTokenInformation(Session->UserToken, TokenSessionId, &SessionId, sizeof(SessionId)))
+        ERR("WL: SetTokenInformation(TokenSessionId) failed (error %lu)\n", GetLastError());
 
     /* Loading personal settings */
     DisplayStatusMessage(Session, Session->WinlogonDesktop, IDS_LOADINGYOURPERSONALSETTINGS);
@@ -1255,6 +1259,30 @@ UninitializeSAS(
     UnregisterClassW(WINLOGON_SAS_CLASS, hAppInstance);
 }
 
+static
+VOID
+ShutdownSessionZero(VOID)
+{
+    HANDLE Request, Complete;
+
+    Request = OpenEventW(EVENT_MODIFY_STATE, FALSE, L"Global\\WininitShutdownRequest");
+    Complete = OpenEventW(SYNCHRONIZE, FALSE, L"Global\\WininitShutdownComplete");
+    if (Request && Complete)
+    {
+        SetEvent(Request);
+        WaitForSingleObject(Complete, INFINITE);
+    }
+    else
+    {
+        ERR("WL: Could not reach wininit for the session 0 shutdown (error %lu)\n", GetLastError());
+    }
+
+    if (Complete)
+        CloseHandle(Complete);
+    if (Request)
+        CloseHandle(Request);
+}
+
 NTSTATUS
 HandleShutdown(
     IN OUT PWLSESSION Session,
@@ -1299,11 +1327,13 @@ HandleShutdown(
     // SwitchDesktop(Session->WinlogonDesktop); // Re-enable if you notice the desktop may have switched to something else.
     DisplayStatusMessage(Session, Session->WinlogonDesktop, uMsgId);
 
+    ShutdownSessionZero();
+
     /* Destroy SAS window */
     UninitializeSAS(Session);
 
     /* Now we can shut down NT */
-    ERR("Shutting down NT...\n");
+    TRACE("Shutting down NT...\n");
     RtlAdjustPrivilege(SE_SHUTDOWN_PRIVILEGE, TRUE, FALSE, &Old);
     if (wlxAction == WLX_SAS_ACTION_SHUTDOWN_REBOOT)
     {

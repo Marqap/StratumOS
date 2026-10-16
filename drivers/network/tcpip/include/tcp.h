@@ -173,10 +173,22 @@ UINT TCPAllocatePort( const UINT HintPort );
 
 VOID TCPFreePort( const UINT Port );
 
+UINT TCPAllocatePortForAddress( const IP_ADDRESS *Address, const UINT HintPort );
+
+VOID TCPFreePortForAddress( const IP_ADDRESS *Address, const UINT Port );
+
+VOID TCPMapToDualStack(
+    PIP_ADDRESS Address);
+
 NTSTATUS TCPGetSockAddress
 ( PCONNECTION_ENDPOINT Connection,
   PTRANSPORT_ADDRESS TransportAddress,
+  ULONG TransportAddressLength,
   BOOLEAN RemoteAddress );
+
+NTSTATUS TCPGetSockPort
+( PCONNECTION_ENDPOINT Connection,
+  PUSHORT Port );
 
 NTSTATUS TCPStartup(
   VOID);

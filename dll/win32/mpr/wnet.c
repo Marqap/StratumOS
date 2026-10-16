@@ -2021,6 +2021,11 @@ static DWORD wnet_use_connection( struct use_connection_context *ctxt )
     if (ctxt->flags & CONNECT_INTERACTIVE)
         return ERROR_BAD_NET_NAME;
 
+#ifdef __REACTOS__
+    if (ctxt->accessname && ctxt->buffer_size && !*ctxt->buffer_size)
+        return ERROR_INVALID_PARAMETER;
+#endif
+
     if ((ret = ctxt->pre_set_accessname(ctxt, netres.lpLocalName)))
         return ret;
 
@@ -2568,6 +2573,14 @@ DWORD WINAPI WNetGetUniversalNameA ( LPCSTR lpLocalPath, DWORD dwInfoLevel,
     FIXME( "(%s, 0x%08lX, %p, %p): stub\n",
            debugstr_a(lpLocalPath), dwInfoLevel, lpBuffer, lpBufferSize);
 
+#ifdef __REACTOS__
+    if (!lpBufferSize)
+    {
+        SetLastError(WN_BAD_POINTER);
+        return WN_BAD_POINTER;
+    }
+
+#endif
     switch (dwInfoLevel)
     {
     case UNIVERSAL_NAME_INFO_LEVEL:
@@ -2615,6 +2628,14 @@ DWORD WINAPI WNetGetUniversalNameW ( LPCWSTR lpLocalPath, DWORD dwInfoLevel,
     FIXME( "(%s, 0x%08lX, %p, %p): stub\n",
            debugstr_w(lpLocalPath), dwInfoLevel, lpBuffer, lpBufferSize);
 
+#ifdef __REACTOS__
+    if (!lpBufferSize)
+    {
+        SetLastError(WN_BAD_POINTER);
+        return WN_BAD_POINTER;
+    }
+
+#endif
     switch (dwInfoLevel)
     {
     case UNIVERSAL_NAME_INFO_LEVEL:
@@ -2640,6 +2661,13 @@ DWORD WINAPI WNetGetUniversalNameW ( LPCWSTR lpLocalPath, DWORD dwInfoLevel,
         break;
     }
     case REMOTE_NAME_INFO_LEVEL:
+#ifdef __REACTOS__
+        if (GetDriveTypeW(lpLocalPath) != DRIVE_REMOTE)
+        {
+            err = WN_NOT_CONNECTED;
+            break;
+        }
+#endif
         err = WN_NO_NETWORK;
         break;
 

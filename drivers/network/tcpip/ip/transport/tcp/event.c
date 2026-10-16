@@ -182,13 +182,16 @@ VOID
 TCPFinEventHandler(void *arg, const err_t err)
 {
    PCONNECTION_ENDPOINT Connection = (PCONNECTION_ENDPOINT)arg, LastConnection;
-   const NTSTATUS Status = TCPTranslateError(err);
+   NTSTATUS Status = TCPTranslateError(err);
 
    ASSERT(Connection->SocketContext == NULL);
    ASSERT(Connection->AddressFile);
    ASSERT(err != ERR_OK);
 
    LockObject(Connection);
+
+   if (err == ERR_RST && IsListEmpty(&Connection->ConnectRequest))
+       Status = STATUS_CONNECTION_RESET;
 
    /* Complete all outstanding requests now */
    FlushAllQueues(Connection, Status);
@@ -343,7 +346,9 @@ TCPSendEventHandler(void *arg, const u16_t space)
 
         Status = TCPTranslateError(LibTCPSend(Connection,
                                               SendBuffer,
-                                              SendLen, &BytesSent, TRUE));
+                                              SendLen, &BytesSent,
+                                              ((PTDI_REQUEST_KERNEL_SEND)&IoGetCurrentIrpStackLocation(Irp)->Parameters)->SendFlags,
+                                              TRUE));
 
         TI_DbgPrint(DEBUG_TCP,("TCP Bytes: %d\n", BytesSent));
 

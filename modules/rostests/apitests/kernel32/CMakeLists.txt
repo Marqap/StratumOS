@@ -1,4 +1,5 @@
 
+add_subdirectory(muitest)
 add_subdirectory(redirptest)
 
 add_message_headers(ANSI FormatMessage.mc)
@@ -31,6 +32,8 @@ list(APPEND SOURCE
     GetNumaNodeProcessorMaskEx.c
     GetOsSafeBootMode.c
     GetPackageFamilyName.c
+    GetProcessorSystemCycleTime.c
+    AppModelInternal.c
     GetSystemWow64Directory.c
     GetTempFileName.c
     GetTempPath2.c
@@ -54,8 +57,10 @@ list(APPEND SOURCE
     lstrcpynW.c
     lstrlen.c
     Mailslot.c
+    MuiResources.c
     MultiByteToWideChar.c
     Pipes.c
+    PackageNames.c
     PixeloramaCompat.c
     ProcessPreferredUILanguages.c
     PssSnapshot.c

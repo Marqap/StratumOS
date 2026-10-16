@@ -390,7 +390,7 @@ WlanSvcDoScan(PWLANSVC_INTERFACE Iface, PDOT11_SSID pSsid)
     DWORD dwResult;
 
     dwResult = NwifiScan(Iface->NwifiIndex, pSsid, dot11_BSS_type_any);
-    if (dwResult != ERROR_SUCCESS && dwResult != ERROR_NOT_READY)
+    if (dwResult != ERROR_SUCCESS && dwResult != ERROR_NOT_READY && dwResult != ERROR_BUSY)
         return dwResult;
 
     return WlanSvcRefreshBssCache(Iface);
@@ -605,7 +605,7 @@ WlanSvcBuildBssList(PWLANSVC_INTERFACE Iface,
         out->ullTimestamp = bss->BeaconTimestamp;
         out->ullHostTimestamp = bss->HostTimestamp;
         out->usCapabilityInformation = bss->CapabilityInformation;
-        out->ulChCenterFrequency = bss->ChCenterFrequency;
+        out->ulChCenterFrequency = bss->ChCenterFrequency * 1000;
         out->wlanRateSet.uRateSetLength = bss->RateCount;
         for (r = 0; r < bss->RateCount; r++)
             out->wlanRateSet.usRateSet[r] = bss->Rates[r];

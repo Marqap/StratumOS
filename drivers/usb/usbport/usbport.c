@@ -2751,7 +2751,7 @@ USBPORT_TimeoutAllEndpoints(IN PDEVICE_OBJECT FdoDevice)
         Endpoint = CONTAINING_RECORD(Entry, USBPORT_ENDPOINT, EndpointLink);
         /* TimerFlagsSpinLock serializes the use of TimeoutLink. Pin while
          * holding the list lock, also used by DeleteEndpoint's final check. */
-        InterlockedIncrement(&Endpoint->LockCounter);
+        InterlockedIncrement(&Endpoint->TimeoutPin);
         InsertTailList(&Endpoints, &Endpoint->TimeoutLink);
     }
     KeReleaseSpinLock(&FdoExtension->EndpointListSpinLock, OldIrql);
@@ -2778,7 +2778,7 @@ USBPORT_TimeoutAllEndpoints(IN PDEVICE_OBJECT FdoDevice)
         KeReleaseSpinLock(&Endpoint->EndpointSpinLock, OldIrql);
         if (Expired)
             USBPORT_InvalidateEndpointHandler(FdoDevice, Endpoint, INVALIDATE_ENDPOINT_WORKER_THREAD);
-        InterlockedDecrement(&Endpoint->LockCounter);
+        InterlockedDecrement(&Endpoint->TimeoutPin);
     }
 }
 
@@ -3326,6 +3326,19 @@ USBPORT_MiniportCompleteTransfer(IN PVOID MiniPortExtension,
             DumpContext->CompletedLength = TransferLength;
             KeMemoryBarrier();
             InterlockedExchange(&DumpContext->Completed, 1);
+        }
+        return;
+    }
+
+    DumpContext = ((PUSBPORT_DEVICE_EXTENSION)Transfer->FdoDevice->DeviceExtension)->Aux.KeyboardContext;
+    if ((DumpContext != NULL) && DumpContext->DumpMode)
+    {
+        if ((Transfer->Endpoint == DumpContext->BulkInEndpoint) && USBD_SUCCESS(USBDStatus) && (Transfer->SgList.MappedSystemVa != NULL))
+        {
+            ULONG StashLength = min(TransferLength, ROS_USB_KEYBOARD_BOOT_REPORT_SIZE);
+
+            RtlCopyMemory(DumpContext->Stash, Transfer->SgList.MappedSystemVa, StashLength);
+            DumpContext->StashLength = StashLength;
         }
         return;
     }

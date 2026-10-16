@@ -58,7 +58,10 @@
 #include "wine/debug.h"
 #ifdef __REACTOS__
 #include <tdiinfo.h>
+#include <tcpioctl.h>
+#include <tcpip_undoc.h>
 #include "ifenum.h"
+#include "ipstats.h"
 #include "route.h"
 #endif
 
@@ -784,8 +787,6 @@ err:
     return err;
 }
 
-#ifndef __REACTOS__
-
 static void address_entry_free( void *ptr, ULONG offset, void *ctxt )
 {
     HeapFree( GetProcessHeap(), 0, ptr );
@@ -1225,6 +1226,35 @@ static DWORD dns_servers_query_code( ULONG family )
     return DnsConfigDnsServersUnspec;
 }
 
+#ifdef __REACTOS__
+static void adapter_dns_suffix( const WCHAR *name, WCHAR *suffix )
+{
+    static const WCHAR interfaces[] = L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\";
+    static const WCHAR *values[] = { L"Domain", L"DhcpDomain" };
+    WCHAR path[ARRAY_SIZE(interfaces) + MAX_ADAPTER_NAME_LENGTH + 1];
+    DWORD size, type, i;
+    HKEY key;
+
+    suffix[0] = 0;
+    if (wcslen( name ) > MAX_ADAPTER_NAME_LENGTH) return;
+    wcscpy( path, interfaces );
+    wcscat( path, name );
+    if (RegOpenKeyExW( HKEY_LOCAL_MACHINE, path, 0, KEY_READ, &key )) return;
+
+    for (i = 0; i < ARRAY_SIZE(values); i++)
+    {
+        size = (MAX_DNS_SUFFIX_STRING_LENGTH - 1) * sizeof(WCHAR);
+        if (!RegQueryValueExW( key, values[i], NULL, &type, (BYTE *)suffix, &size ) && type == REG_SZ)
+        {
+            suffix[size / sizeof(WCHAR)] = 0;
+            if (suffix[0]) break;
+        }
+        suffix[0] = 0;
+    }
+    RegCloseKey( key );
+}
+#endif
+
 static DWORD dns_info_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags )
 {
     char buf[FIELD_OFFSET(DNS_ADDR_ARRAY, AddrArray[3])];
@@ -1233,7 +1263,9 @@ static DWORD dns_info_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags
     DWORD err, i, size, attempt, sockaddr_len;
     WCHAR name[MAX_ADAPTER_NAME_LENGTH + 1];
     DNS_ADDR_ARRAY *servers;
+#ifndef __REACTOS__
     WCHAR *search;
+#endif
 
     while (aa)
     {
@@ -1241,6 +1273,9 @@ static DWORD dns_info_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags
         if (!(flags & GAA_FLAG_SKIP_DNS_SERVER))
         {
             servers = (DNS_ADDR_ARRAY *)buf;
+#ifdef __REACTOS__
+            size = sizeof(buf);
+#endif
             for (attempt = 0; attempt < 5; attempt++)
             {
                 err = DnsQueryConfig( query, 0, name, NULL, servers, &size );
@@ -1283,6 +1318,9 @@ static DWORD dns_info_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags
         if (!aa->DnsSuffix) return ERROR_NOT_ENOUGH_MEMORY;
         aa->DnsSuffix[0] = '\0';
 
+#ifdef __REACTOS__
+        adapter_dns_suffix( name, aa->DnsSuffix );
+#else
         if (!DnsQueryConfig( DnsConfigSearchList, 0, name, NULL, NULL, &size ) &&
             (search = malloc( size )))
         {
@@ -1293,6 +1331,7 @@ static DWORD dns_info_alloc( IP_ADAPTER_ADDRESSES *aa, ULONG family, ULONG flags
             }
             free( search );
         }
+#endif
 
         aa = aa->Next;
     }
@@ -1373,6 +1412,31 @@ static DWORD adapters_addresses_alloc( ULONG family, ULONG flags, IP_ADAPTER_ADD
     err = dns_info_alloc( aa, family, flags );
     if (err) goto err;
 
+#ifdef __REACTOS__
+    for (i = 0; i < *count; i++)
+    {
+        MIB_IPINTERFACE_ROW row;
+
+        memset( &row, 0, sizeof(row) );
+        row.Family = AF_INET;
+        row.InterfaceLuid = luids[i];
+        if (!GetIpInterfaceEntry( &row ))
+        {
+            aa[i].Flags |= IP_ADAPTER_IPV4_ENABLED;
+            aa[i].Ipv4Metric = row.Metric;
+        }
+        memset( &row, 0, sizeof(row) );
+        row.Family = AF_INET6;
+        row.InterfaceLuid = luids[i];
+        if (!GetIpInterfaceEntry( &row ))
+        {
+            aa[i].Flags |= IP_ADAPTER_IPV6_ENABLED;
+            aa[i].Ipv6IfIndex = row.InterfaceIndex;
+            aa[i].Ipv6Metric = row.Metric;
+        }
+    }
+#endif
+
 err:
     NsiFreeTable( luids, rw, dyn, stat );
     if (!err) *info = aa;
@@ -1411,6 +1475,48 @@ ULONG WINAPI DECLSPEC_HOTPATCH GetAdaptersAddresses( ULONG family, ULONG flags, 
 
     adapters_addresses_free( info );
     return err;
+}
+
+#ifdef __REACTOS__
+DWORD WINAPI NhpAllocateAndGetInterfaceInfoFromStack( IP_INTERFACE_NAME_INFO **table, DWORD *count, BOOL order,
+                                                      HANDLE heap, DWORD flags )
+{
+    struct nsi_ndis_ifinfo_static *stat;
+    IP_INTERFACE_NAME_INFO *out;
+    NET_LUID *keys;
+    DWORD err, i, num, used = 0;
+
+    TRACE( "(%p, %p, %d, %p, %#lx)\n", table, count, order, heap, flags );
+
+    if (!table || !count) return ERROR_INVALID_PARAMETER;
+
+    err = NsiAllocateAndGetTable( 1, &NPI_MS_NDIS_MODULEID, NSI_NDIS_IFINFO_TABLE, (void **)&keys, sizeof(*keys),
+                                  NULL, 0, NULL, 0, (void **)&stat, sizeof(*stat), &num, 0 );
+    if (err) return err;
+
+    out = HeapAlloc( heap, flags, max( num, 1 ) * sizeof(*out) );
+    if (!out)
+    {
+        NsiFreeTable( keys, NULL, NULL, stat );
+        return ERROR_NOT_ENOUGH_MEMORY;
+    }
+
+    for (i = 0; i < num; i++)
+    {
+        if (stat[i].type == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        out[used].Index = stat[i].if_index;
+        out[used].MediaType = stat[i].type;
+        out[used].ConnectionType = stat[i].conn_type;
+        out[used].AccessType = stat[i].access_type;
+        out[used].DeviceGuid = stat[i].if_guid;
+        memset( &out[used].InterfaceGuid, 0, sizeof(out[used].InterfaceGuid) );
+        used++;
+    }
+
+    NsiFreeTable( keys, NULL, NULL, stat );
+    *table = out;
+    *count = used;
+    return ERROR_SUCCESS;
 }
 #endif
 
@@ -2220,7 +2326,18 @@ DWORD WINAPI GetIpForwardTable( MIB_IPFORWARDTABLE *table, ULONG *size, BOOL sor
         row->dwForwardProto = rw[i].protocol;
         row->dwForwardAge = dyn[i].age;
         row->dwForwardNextHopAS = 0;
+#ifdef __REACTOS__
+        {
+            MIB_IPINTERFACE_ROW ifrow;
+
+            memset( &ifrow, 0, sizeof(ifrow) );
+            ifrow.Family = AF_INET;
+            ifrow.InterfaceLuid = keys[i].luid;
+            row->dwForwardMetric1 = rw[i].metric + (GetIpInterfaceEntry( &ifrow ) ? 0 : ifrow.Metric);
+        }
+#else
         row->dwForwardMetric1 = rw[i].metric; /* FIXME: add interface metric */
+#endif
         row->dwForwardMetric2 = 0;
         row->dwForwardMetric3 = 0;
         row->dwForwardMetric4 = 0;
@@ -2605,6 +2722,83 @@ err:
     for (i = 0; i < 2; i++) NsiFreeTable( key[i], rw[i], dyn[i], NULL );
     return err;
 }
+
+#ifdef __REACTOS__
+static DWORD ipnet_row2_get_luid( const MIB_IPNET_ROW2 *row, NET_LUID *luid )
+{
+    NET_IFINDEX index;
+
+    if (row->InterfaceLuid.Value)
+    {
+        if (ConvertInterfaceLuidToIndex( &row->InterfaceLuid, &index )) return ERROR_FILE_NOT_FOUND;
+        *luid = row->InterfaceLuid;
+        return ERROR_SUCCESS;
+    }
+    if (!row->InterfaceIndex) return ERROR_INVALID_PARAMETER;
+    if (ConvertInterfaceIndexToLuid( row->InterfaceIndex, luid )) return ERROR_FILE_NOT_FOUND;
+    return ERROR_SUCCESS;
+}
+
+static BOOL ipnet_row2_address_equal( const SOCKADDR_INET *a, const SOCKADDR_INET *b )
+{
+    if (a->si_family != b->si_family) return FALSE;
+    if (a->si_family == AF_INET) return a->Ipv4.sin_addr.s_addr == b->Ipv4.sin_addr.s_addr;
+    return !memcmp( &a->Ipv6.sin6_addr, &b->Ipv6.sin6_addr, sizeof(a->Ipv6.sin6_addr) );
+}
+
+/******************************************************************
+ *    GetIpNetEntry2 (IPHLPAPI.@)
+ */
+DWORD WINAPI GetIpNetEntry2( MIB_IPNET_ROW2 *row )
+{
+    MIB_IPNET_TABLE2 *table;
+    NET_LUID luid;
+    DWORD err, i;
+
+    TRACE( "%p\n", row );
+
+    if (!row || (row->Address.si_family != AF_INET && row->Address.si_family != AF_INET6))
+        return ERROR_INVALID_PARAMETER;
+    if (!row->InterfaceLuid.Value && !row->InterfaceIndex) return ERROR_NOT_FOUND;
+    if ((err = ipnet_row2_get_luid( row, &luid ))) return err;
+    if ((err = GetIpNetTable2( row->Address.si_family, &table ))) return err;
+
+    err = ERROR_NOT_FOUND;
+    for (i = 0; i < table->NumEntries; i++)
+    {
+        if (table->Table[i].InterfaceLuid.Value != luid.Value ||
+            !ipnet_row2_address_equal( &table->Table[i].Address, &row->Address ))
+            continue;
+        *row = table->Table[i];
+        err = ERROR_SUCCESS;
+        break;
+    }
+    FreeMibTable( table );
+    return err;
+}
+
+/******************************************************************
+ *    ResolveIpNetEntry2 (IPHLPAPI.@)
+ */
+DWORD WINAPI ResolveIpNetEntry2( MIB_IPNET_ROW2 *row, const SOCKADDR_INET *source )
+{
+    ULONG mac[2], len = sizeof(mac);
+    NET_LUID luid;
+    DWORD err;
+
+    TRACE( "%p, %p\n", row, source );
+
+    if (!row || (row->Address.si_family != AF_INET && row->Address.si_family != AF_INET6))
+        return ERROR_INVALID_PARAMETER;
+    if ((err = ipnet_row2_get_luid( row, &luid ))) return err;
+    if (row->Address.si_family != AF_INET) return ERROR_NOT_SUPPORTED;
+
+    err = SendARP( row->Address.Ipv4.sin_addr.s_addr,
+                   source && source->si_family == AF_INET ? source->Ipv4.sin_addr.s_addr : 0, mac, &len );
+    if (err) return err;
+    return GetIpNetEntry2( row );
+}
+#endif
 
 /******************************************************************
  *    GetIpStatistics (IPHLPAPI.@)
@@ -4168,12 +4362,111 @@ DWORD WINAPI NotifyUnicastIpAddressChange(ADDRESS_FAMILY family, PUNICAST_IPADDR
  * FIXME
  *  Stub, returns ERROR_NOT_SUPPORTED.
  */
+#ifdef __REACTOS__
+DWORD WINAPI SendARP(IPAddr DestIP, IPAddr SrcIP, PULONG pMacAddr, PULONG PhyAddrLen)
+{
+    UNICODE_STRING name = RTL_CONSTANT_STRING(L"\\Device\\Ip");
+    MIB_UNICASTIPADDRESS_TABLE *table;
+    OBJECT_ATTRIBUTES attr;
+    IO_STATUS_BLOCK iosb;
+    IPAddr ips[2] = { DestIP, SrcIP };
+    MIB_IFROW row;
+    NET_IFINDEX index = 0;
+    BOOL found, remote_local = FALSE;
+    NTSTATUS status;
+    HANDLE file;
+    DWORD err, i;
+
+    TRACE("(DestIP 0x%08lx, SrcIP 0x%08lx, pMacAddr %p, PhyAddrLen %p)\n",
+          DestIP, SrcIP, pMacAddr, PhyAddrLen);
+
+    if (!pMacAddr || !PhyAddrLen) return ERROR_INVALID_PARAMETER;
+    if (!DestIP)
+    {
+        *PhyAddrLen = 0;
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    if (!SrcIP && (err = GetBestInterface( DestIP, &index )))
+    {
+        *PhyAddrLen = 0;
+        return ERROR_BAD_NET_NAME;
+    }
+    if ((err = GetUnicastIpAddressTable( AF_INET, &table )))
+    {
+        *PhyAddrLen = 0;
+        return err;
+    }
+    for (i = 0; i < table->NumEntries; i++)
+    {
+        if (SrcIP ? table->Table[i].Address.Ipv4.sin_addr.s_addr == SrcIP
+                  : table->Table[i].InterfaceIndex == index)
+            break;
+    }
+    found = i < table->NumEntries;
+    if (found)
+    {
+        index = table->Table[i].InterfaceIndex;
+        ips[1] = table->Table[i].Address.Ipv4.sin_addr.s_addr;
+        for (i = 0; i < table->NumEntries; i++)
+        {
+            if (table->Table[i].Address.Ipv4.sin_addr.s_addr == DestIP &&
+                table->Table[i].InterfaceIndex != index)
+                remote_local = TRUE;
+        }
+    }
+    FreeMibTable( table );
+    if (!found)
+    {
+        *PhyAddrLen = 0;
+        return SrcIP ? ERROR_NOT_FOUND : ERROR_BAD_NET_NAME;
+    }
+
+    memset( &row, 0, sizeof(row) );
+    row.dwIndex = index;
+    if ((err = GetIfEntry( &row )))
+    {
+        *PhyAddrLen = 0;
+        return err;
+    }
+    if (*PhyAddrLen < row.dwPhysAddrLen)
+    {
+        *PhyAddrLen = 0;
+        return ERROR_BUFFER_OVERFLOW;
+    }
+    if (!row.dwPhysAddrLen || remote_local)
+    {
+        *PhyAddrLen = 0;
+        return row.dwPhysAddrLen ? ERROR_BAD_NET_NAME : NO_ERROR;
+    }
+
+    InitializeObjectAttributes( &attr, &name, OBJ_CASE_INSENSITIVE, NULL, NULL );
+    status = NtOpenFile( &file, SYNCHRONIZE, &attr, &iosb, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         FILE_SYNCHRONOUS_IO_NONALERT );
+    if (!NT_SUCCESS(status))
+    {
+        *PhyAddrLen = 0;
+        return RtlNtStatusToDosError( status );
+    }
+    status = NtDeviceIoControlFile( file, NULL, NULL, NULL, &iosb, IOCTL_IP_RESOLVE_NEIGHBOR,
+                                    ips, sizeof(ips), pMacAddr, *PhyAddrLen );
+    CloseHandle( file );
+    if (!NT_SUCCESS(status))
+    {
+        *PhyAddrLen = 0;
+        return ERROR_BAD_NET_NAME;
+    }
+    *PhyAddrLen = (ULONG)iosb.Information;
+    return NO_ERROR;
+}
+#else
 DWORD WINAPI SendARP(IPAddr DestIP, IPAddr SrcIP, PULONG pMacAddr, PULONG PhyAddrLen)
 {
   FIXME("(DestIP 0x%08lx, SrcIP 0x%08lx, pMacAddr %p, PhyAddrLen %p): stub\n",
    DestIP, SrcIP, pMacAddr, PhyAddrLen);
   return ERROR_NOT_SUPPORTED;
 }
+#endif
 
 
 /******************************************************************
@@ -4317,8 +4610,13 @@ DWORD WINAPI SetIpTTL(UINT nTTL)
  */
 DWORD WINAPI SetTcpEntry(PMIB_TCPROW pTcpRow)
 {
+#ifdef __REACTOS__
+  TRACE("(pTcpRow %p)\n", pTcpRow);
+  return setTcpEntry(pTcpRow);
+#else
   FIXME("(pTcpRow %p): stub\n", pTcpRow);
   return 0;
+#endif
 }
 
 /***********************************************************************
@@ -4958,6 +5256,9 @@ DWORD WINAPI GetBestRoute2( NET_LUID *luid, NET_IFINDEX index,
     int max_prefix_len;
     DWORD ret;
     BOOL v6;
+#ifdef __REACTOS__
+    NET_IFINDEX if_index;
+#endif
 
     TRACE( "(%p, %ld, %p, %p, 0x%08lx, %p, %p).\n", luid, index, src, dst, options, bestroute, bestaddress );
 
@@ -5033,6 +5334,9 @@ DWORD WINAPI GetBestRoute2( NET_LUID *luid, NET_IFINDEX index,
         }
     }
 
+#ifdef __REACTOS__
+    if_index = uni_row ? index : 0;
+#endif
     uni_row = NULL;
     if (!src && !(v6 && IN6_IS_ADDR_LINKLOCAL(&dst->Ipv6.sin6_addr)))
     {
@@ -5097,12 +5401,30 @@ skip_system_route:
 
     if (max_prefix_len == -1)
     {
+#ifdef __REACTOS__
+        if (if_index && (v6 ? IN6_IS_ADDR_LINKLOCAL(&dst->Ipv6.sin6_addr)
+                            : dst->Ipv4.sin_addr.S_un.S_un_b.s_b1 == 169 && dst->Ipv4.sin_addr.S_un.S_un_b.s_b2 == 254)
+            && (uni_row = find_first_matching_unicast_addr( uni, v6, src, NULL, if_index )))
+        {
+            bestroute->DestinationPrefix.Prefix.si_family = dst->si_family;
+            bestroute->NextHop.si_family = dst->si_family;
+            *bestaddress = uni_row->Address;
+            ret = ERROR_SUCCESS;
+            goto done;
+        }
+#endif
         ret = ERROR_NETWORK_UNREACHABLE;
         goto done;
     }
     index = fwd->Table[best_idx].InterfaceIndex;
+#ifdef __REACTOS__
+    if (fwd->Table[best_idx].InterfaceLuid.Info.IfType != IF_TYPE_SOFTWARE_LOOPBACK
+        && ((v6 && IN6_IS_ADDR_LOOPBACK(&dst->Ipv6.sin6_addr))
+        || (!v6 && dst->Ipv4.sin_addr.S_un.S_un_b.s_b1 == 127)))
+#else
     if (!fwd->Table[best_idx].Loopback && ((v6 && IN6_IS_ADDR_LOOPBACK(&dst->Ipv6.sin6_addr))
         || (!v6 && dst->Ipv4.sin_addr.S_un.S_un_b.s_b1 == 127)))
+#endif
     {
         ret = ERROR_INVALID_PARAMETER;
         goto done;

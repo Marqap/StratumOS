@@ -16,6 +16,8 @@ if(REACTOS_USE_WDDM)
     list(APPEND NATIVE_SOURCE
         native12.cpp
         native12_device5.cpp
+        native12_library.cpp
+        native12_device10.cpp
         native12_objects.cpp
         native12_pipeline.cpp
         native12_queue.cpp
@@ -38,10 +40,12 @@ if(REACTOS_USE_WDDM)
     target_compile_definitions(d3d12 PRIVATE REACTOS_D3D12_NATIVE_UMD __WINESRC__)
     target_link_libraries(d3d12 cpprt)
 endif()
-target_link_libraries(d3d12 vkd3d dx10guid uuid wine)
+target_link_libraries(d3d12 dx10guid uuid wine)
 if(REACTOS_USE_WDDM)
     add_importlibs(d3d12 win32u)
 endif()
 add_importlibs(d3d12 dxgi d3dwine gdi32 user32 ole32 advapi32 msvcrt kernel32 ntdll)
 add_dependencies(d3d12 d3d_idl_headers wineheaders)
 add_cd_file(TARGET d3d12 DESTINATION reactos/system32 FOR all)
+
+include(${REACTOS_SOURCE_DIR}/submodules/dxilconv.cmake)

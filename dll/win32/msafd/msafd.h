@@ -29,6 +29,7 @@
 #include <tdi.h>
 #include <afd/shared.h>
 #include <mswsock.h>
+#include <ws2tcpip.h>
 
 #include <wine/debug.h>
 WINE_DEFAULT_DEBUG_CHANNEL(msafd);
@@ -62,6 +63,7 @@ typedef struct _SOCKET_INFORMATION {
 	BOOL TrySAN;
 	WSAPROTOCOL_INFOW ProtocolInfo;
 	struct _SOCKET_INFORMATION *NextSocket;
+	BOOL RandomizePort;
 } SOCKET_INFORMATION, *PSOCKET_INFORMATION;
 
 
@@ -428,6 +430,15 @@ WSPDisconnectEx(
     IN DWORD dwFlags,
     IN DWORD reserved);
 
+INT
+PASCAL
+WSPRecvMsg(
+    IN SOCKET Handle,
+    IN OUT LPWSAMSG lpMsg,
+    OUT LPDWORD lpdwNumberOfBytesRecvd,
+    IN LPWSAOVERLAPPED lpOverlapped,
+    IN LPWSAOVERLAPPED_COMPLETION_ROUTINE lpCompletionRoutine);
+
 VOID
 WSPAPI
 WSPGetAcceptExSockaddrs(
@@ -524,15 +535,15 @@ MsafdReturnWithErrno(
     {
         *Errno = TranslateNtStatusError(Status);
 
-        if (ReturnedBytes)
-            *ReturnedBytes = (*Errno == 0) ? Received : 0;
+        if (ReturnedBytes && (*Errno == 0 || Status == STATUS_BUFFER_OVERFLOW))
+            *ReturnedBytes = Received;
 
         return (*Errno == 0) ? 0 : SOCKET_ERROR;
     }
     else
     {
-        if (ReturnedBytes)
-            *ReturnedBytes = (Status == STATUS_SUCCESS) ? Received : 0;
+        if (ReturnedBytes && (Status == STATUS_SUCCESS || Status == STATUS_BUFFER_OVERFLOW))
+            *ReturnedBytes = Received;
 
         return (Status == STATUS_SUCCESS) ? 0 : SOCKET_ERROR;
     }
@@ -541,5 +552,12 @@ MsafdReturnWithErrno(
 VOID
 MsafdWaitForAlert(
     _In_ HANDLE hObject);
+
+NTSTATUS
+MsafdWaitForCompletion(
+    _In_ PSOCKET_INFORMATION Socket,
+    _In_ HANDLE hObject,
+    _In_ PIO_STATUS_BLOCK IoStatusBlock,
+    _In_ DWORD Timeout);
 
 #endif /* __MSAFD_H */

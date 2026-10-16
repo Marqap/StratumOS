@@ -148,6 +148,8 @@ VOID NTAPI IPTimeoutDpcFn(PKDPC Dpc,
 
     /* Clean possible outdated cached neighbor addresses */
     NBTimeout();
+
+    IGMPTimeout();
 }
 
 
@@ -324,7 +326,7 @@ BOOLEAN IPRegisterInterface(
  */
 {
     KIRQL OldIrql;
-    UINT ChosenIndex = 0;
+    UINT ChosenIndex = 1;
     BOOLEAN IndexHasBeenChosen;
     IF_LIST_ITER(Interface);
 

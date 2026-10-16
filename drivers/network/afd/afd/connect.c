@@ -9,6 +9,9 @@
  */
 
 #include "afd.h"
+#include <ws2ipdef.h>
+#define IPHLPAPI_DLL_LINKAGE
+#include <netioapi.h>
 
 NTSTATUS
 NTAPI
@@ -234,6 +237,53 @@ AfdSetConnectDataSize(PDEVICE_OBJECT DeviceObject, PIRP Irp,
 }
 
 
+static
+BOOLEAN
+AfdIsUnspecifiedIpAddress(
+    _In_ PTRANSPORT_ADDRESS Address)
+{
+    PTDI_ADDRESS_IP Ip;
+
+    if (Address->TAAddressCount == 0 ||
+        Address->Address[0].AddressType != TDI_ADDRESS_TYPE_IP ||
+        Address->Address[0].AddressLength < sizeof(TDI_ADDRESS_IP))
+    {
+        return FALSE;
+    }
+
+    Ip = (PTDI_ADDRESS_IP)Address->Address[0].Address;
+    return Ip->in_addr == 0 && Ip->sin_port == 0;
+}
+
+static
+ULONG
+AfdRouteSourceAddress(
+    _In_ PTRANSPORT_ADDRESS Address)
+{
+    PTDI_ADDRESS_IP Ip;
+    SOCKADDR_INET Destination, Source;
+    MIB_IPFORWARD_ROW2 Route;
+
+    if (Address->TAAddressCount == 0 ||
+        Address->Address[0].AddressType != TDI_ADDRESS_TYPE_IP ||
+        Address->Address[0].AddressLength < sizeof(TDI_ADDRESS_IP))
+    {
+        return 0;
+    }
+
+    Ip = (PTDI_ADDRESS_IP)Address->Address[0].Address;
+    RtlZeroMemory(&Destination, sizeof(Destination));
+    Destination.Ipv4.sin_family = AF_INET;
+    Destination.Ipv4.sin_port = Ip->sin_port;
+    Destination.Ipv4.sin_addr.s_addr = Ip->in_addr;
+    if (!NT_SUCCESS(GetBestRoute2(NULL, 0, NULL, &Destination, 0, &Route, &Source)) ||
+        Source.si_family != AF_INET)
+    {
+        return 0;
+    }
+    return Source.Ipv4.sin_addr.s_addr;
+}
+
 NTSTATUS
 WarmSocketForConnection(PAFD_FCB FCB) {
     NTSTATUS Status;
@@ -292,7 +342,7 @@ MakeSocketIntoConnection(PAFD_FCB FCB) {
     if (!FCB->Send.Window)
     {
         FCB->Send.Window = ExAllocatePoolWithTag(PagedPool,
-                                                 FCB->Send.Size,
+                                                 FCB->Send.Size * 2,
                                                  TAG_AFD_DATA_BUFFER);
 
         if( !FCB->Send.Window ) return STATUS_NO_MEMORY;
@@ -377,6 +427,7 @@ StreamSocketConnectComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
     PAFD_FCB FCB = (PAFD_FCB)Context;
     PLIST_ENTRY NextIrpEntry;
     PIRP NextIrp;
+    BOOLEAN ConnectFailed;
 
     AFD_DbgPrint(MID_TRACE,("Called: FCB %p, FO %p\n",
                             Context, FCB->FileObject));
@@ -423,12 +474,13 @@ StreamSocketConnectComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
         Status = MakeSocketIntoConnection( FCB );
     }
 
-    if( !NT_SUCCESS(Status) ) {
+    ConnectFailed = !NT_SUCCESS(Status);
+
+    if( ConnectFailed ) {
         FCB->PollState |= AFD_EVENT_CONNECT_FAIL;
         FCB->PollStatus[FD_CONNECT_BIT] = Status;
         AFD_DbgPrint(MID_TRACE,("Going to bound state\n"));
         FCB->SharedData.State = SOCKET_STATE_BOUND;
-        PollReeval( FCB->DeviceExt, FCB->FileObject );
     } else {
         FCB->FilledConnectData = MIN(FCB->ConnectReturnInfo->UserDataLength, FCB->ConnectDataSize);
         if (FCB->FilledConnectData)
@@ -458,6 +510,9 @@ StreamSocketConnectComplete(PDEVICE_OBJECT DeviceObject, PIRP Irp,
         (void)IoSetCancelRoutine(NextIrp, NULL);
         IoCompleteRequest( NextIrp, IO_NETWORK_INCREMENT );
     }
+
+    if( ConnectFailed )
+        PollReeval( FCB->DeviceExt, FCB->FileObject );
 
     if( NT_SUCCESS(Status) ) {
         if( !IsListEmpty( &FCB->PendingIrpList[FUNCTION_SEND] ) ) {
@@ -546,15 +601,25 @@ AfdStreamSocketConnect(PDEVICE_OBJECT DeviceObject, PIRP Irp,
         if (FCB->RemoteAddress)
         {
             ExFreePoolWithTag(FCB->RemoteAddress, TAG_AFD_TRANSPORT_ADDRESS);
+            FCB->RemoteAddress = NULL;
         }
+        FCB->ConnectedSourceAddress = 0;
+
+        if (AfdIsUnspecifiedIpAddress(&ConnectReq->RemoteAddress))
+            return UnlockAndMaybeComplete( FCB, STATUS_SUCCESS, Irp, 0 );
 
         FCB->RemoteAddress =
             TaCopyTransportAddress( &ConnectReq->RemoteAddress );
 
         if( !FCB->RemoteAddress )
+        {
             Status = STATUS_NO_MEMORY;
+        }
         else
+        {
+            FCB->ConnectedSourceAddress = AfdRouteSourceAddress(FCB->RemoteAddress);
             Status = STATUS_SUCCESS;
+        }
 
         return UnlockAndMaybeComplete( FCB, Status, Irp, 0 );
    }

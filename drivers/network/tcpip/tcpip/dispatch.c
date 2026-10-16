@@ -813,15 +813,10 @@ NTSTATUS DispTdiQueryInformation(
                 return STATUS_INVALID_PARAMETER;
             }
 
-			Address->TAAddressCount = 1;
-			Address->Address[0].AddressLength = TDI_ADDRESS_LENGTH_IP;
-			Address->Address[0].AddressType = TDI_ADDRESS_TYPE_IP;
-			Address->Address[0].Address[0].sin_port = AddrFile->Port;
-			Address->Address[0].Address[0].in_addr = AddrFile->Address.Address.IPv4Address;
-			RtlZeroMemory(
-				&Address->Address[0].Address[0].sin_zero,
-				sizeof(Address->Address[0].Address[0].sin_zero));
-			return STATUS_SUCCESS;
+            return AddrBuildTransportAddress(&AddrFile->Address, AddrFile->Port,
+                                             (PTRANSPORT_ADDRESS)Address,
+                                             MmGetMdlByteCount(Irp->MdlAddress) -
+                                             FIELD_OFFSET(TDI_ADDRESS_INFO, Address));
 
           case TDI_CONNECTION_FILE:
             Endpoint =
@@ -832,15 +827,21 @@ NTSTATUS DispTdiQueryInformation(
                 return STATUS_INVALID_PARAMETER;
             }
 
-            Address->TAAddressCount = 1;
-            Address->Address[0].AddressLength = TDI_ADDRESS_LENGTH_IP;
-            Address->Address[0].AddressType = TDI_ADDRESS_TYPE_IP;
-            Address->Address[0].Address[0].sin_port = Endpoint->AddressFile->Port;
-            Address->Address[0].Address[0].in_addr = Endpoint->AddressFile->Address.Address.IPv4Address;
-			RtlZeroMemory(
-				&Address->Address[0].Address[0].sin_zero,
-				sizeof(Address->Address[0].Address[0].sin_zero));
-            return STATUS_SUCCESS;
+            if (NT_SUCCESS(TCPGetSockAddress(Endpoint,
+                                             (PTRANSPORT_ADDRESS)Address,
+                                             MmGetMdlByteCount(Irp->MdlAddress) -
+                                             FIELD_OFFSET(TDI_ADDRESS_INFO, Address),
+                                             FALSE)) &&
+                Address->Address[0].Address[0].sin_port)
+            {
+                return STATUS_SUCCESS;
+            }
+
+            return AddrBuildTransportAddress(&Endpoint->AddressFile->Address,
+                                             Endpoint->AddressFile->Port,
+                                             (PTRANSPORT_ADDRESS)Address,
+                                             MmGetMdlByteCount(Irp->MdlAddress) -
+                                             FIELD_OFFSET(TDI_ADDRESS_INFO, Address));
 
           default:
             TI_DbgPrint(MIN_TRACE, ("Invalid transport context\n"));
@@ -1647,69 +1648,6 @@ NTSTATUS DispTdiQueryInformationEx(
             ExFreePoolWithTag(QueryContext, QUERY_CONTEXT_TAG);
         } else
             Status = STATUS_INSUFFICIENT_RESOURCES;
-    } else if( InputBufferLength == RequestLength ) {
-	/* Handle the case where the user is probing the buffer for length */
-        InputBuffer = (PTCP_REQUEST_QUERY_INFORMATION_EX)
-            IrpSp->Parameters.DeviceIoControl.Type3InputBuffer;
-
-	Size = 0;
-
-        QueryContext = ExAllocatePoolWithTag(NonPagedPool, sizeof(TI_QUERY_CONTEXT), QUERY_CONTEXT_TAG);
-        if (!QueryContext) return STATUS_INSUFFICIENT_RESOURCES;
-        RtlZeroMemory(QueryContext, sizeof(*QueryContext));
-
-	/* Same kernel-buffer trick as the data-fetch path: SEH-copy
-	 * the input from user space, build a kernel-pool MDL, then
-	 * dispatch normally. Avoids ReactOS's broken
-	 * MmProbeAndLockPages behaviour. */
-	QueryContext->KernelInputBuffer = ExAllocatePoolWithTag(
-	    NonPagedPool,
-	    sizeof(TCP_REQUEST_QUERY_INFORMATION_EX),
-	    QUERY_CONTEXT_TAG);
-	if (!QueryContext->KernelInputBuffer)
-	{
-	    ExFreePoolWithTag(QueryContext, QUERY_CONTEXT_TAG);
-	    return STATUS_INSUFFICIENT_RESOURCES;
-	}
-
-	Status = DispTdiCopyQueryRequest(QueryContext, InputBuffer, RequestLength, ContextOffset);
-
-	if (NT_SUCCESS(Status))
-	{
-	    InputMdl = IoAllocateMdl(QueryContext->KernelInputBuffer,
-	                             sizeof(TCP_REQUEST_QUERY_INFORMATION_EX),
-	                             FALSE, FALSE, NULL);
-	    if (InputMdl == NULL)
-	    {
-	        Status = STATUS_INSUFFICIENT_RESOURCES;
-	    }
-	    else
-	    {
-	        MmBuildMdlForNonPagedPool(InputMdl);
-	        InputMdlLocked = TRUE;
-	        QueryContext->UserInputBuffer = InputBuffer;
-	    }
-	}
-
-	if( !NT_SUCCESS(Status) || !InputMdl ) {
-	    if( InputMdl ) IoFreeMdl( InputMdl );
-	    ExFreePoolWithTag(QueryContext, QUERY_CONTEXT_TAG);
-	    return Status;
-	}
-
-	QueryContext->Irp       = Irp;
-	QueryContext->InputMdl  = InputMdl;
-	QueryContext->OutputMdl = NULL;
-
-	Request.RequestNotifyObject = DispTdiQueryInformationExComplete;
-	Request.RequestContext      = QueryContext;
-	Status = InfoTdiQueryInformationEx(&Request,
-					   &QueryContext->QueryInfo.ID,
-					   NULL,
-					   &Size,
-					   &QueryContext->QueryInfo.Context);
-	DispTdiQueryInformationExComplete(QueryContext, Status, Size);
-	TI_DbgPrint(MAX_TRACE, ("Leaving. Status = (0x%X)\n", Status));
     } else Status = STATUS_INVALID_PARAMETER;
 
     TI_DbgPrint(MIN_TRACE, ("Leaving. Status = (0x%X)\n", Status));
@@ -1740,6 +1678,12 @@ NTSTATUS DispTdiSetInformationEx(
     TranContext = (PTRANSPORT_CONTEXT)IrpSp->FileObject->FsContext;
     Info        = (PTCP_REQUEST_SET_INFORMATION_EX)Irp->AssociatedIrp.SystemBuffer;
 
+    if (IrpSp->Parameters.DeviceIoControl.InputBufferLength < FIELD_OFFSET(TCP_REQUEST_SET_INFORMATION_EX, Buffer) ||
+        Info->BufferSize > IrpSp->Parameters.DeviceIoControl.InputBufferLength - FIELD_OFFSET(TCP_REQUEST_SET_INFORMATION_EX, Buffer))
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
     switch ((ULONG_PTR)IrpSp->FileObject->FsContext2) {
     case TDI_TRANSPORT_ADDRESS_FILE:
         Request.Handle.AddressHandle = TranContext->Handle.AddressHandle;
@@ -1764,6 +1708,22 @@ NTSTATUS DispTdiSetInformationEx(
 
     Request.RequestNotifyObject = NULL;
     Request.RequestContext      = NULL;
+
+    if ((ULONG_PTR)IrpSp->FileObject->FsContext2 == TDI_TRANSPORT_ADDRESS_FILE &&
+        Info->ID.toi_class == INFO_CLASS_PROTOCOL)
+    {
+        if (Info->ID.toi_type == INFO_TYPE_ADDRESS_OBJECT)
+            return SetAddressFileInfo(&Info->ID, Request.Handle.AddressHandle, &Info->Buffer, Info->BufferSize);
+
+        if (Info->ID.toi_type == INFO_TYPE_CONNECTION)
+            return SetConnectionInfo(&Info->ID, Request.Handle.AddressHandle, &Info->Buffer, Info->BufferSize);
+    }
+
+    if (Irp->RequestorMode == UserMode &&
+        (ULONG_PTR)IrpSp->FileObject->FsContext2 != TDI_CONTROL_CHANNEL_FILE)
+    {
+        return STATUS_ACCESS_DENIED;
+    }
 
     Status = InfoTdiSetInformationEx(&Request, &Info->ID,
             &Info->Buffer, Info->BufferSize);
@@ -1879,15 +1839,21 @@ WaitForHwAddress ( PDEVICE_OBJECT DeviceObject, PVOID Context) {
     PIRP Irp;
     PNEIGHBOR_CACHE_ENTRY NCE = NULL;
     NTSTATUS Status = STATUS_UNSUCCESSFUL;
+    ULONG Requests = 1;
 
     IoFreeWorkItem(WorkItem->WorkItem);
     Irp = WorkItem->Irp;
     AddrInitIPv4(&Remote, WorkItem->RemoteIP);
     KeQuerySystemTime(&Now);
-    while (Now.QuadPart - WorkItem->StartTime.QuadPart < 10000 * 1000 && !Irp->Cancel) {
+    while (Now.QuadPart - WorkItem->StartTime.QuadPart < 3 * 10000 * 1000 && !Irp->Cancel) {
         NCE = NBLocateNeighbor(&Remote, WorkItem->Interface);
         if (NCE && !(NCE->State & NUD_INCOMPLETE)) {
             break;
+        }
+
+        if ((Now.QuadPart - WorkItem->StartTime.QuadPart) / (10000 * 1000) >= Requests) {
+            ARPTransmit(&Remote, NULL, WorkItem->Interface);
+            Requests++;
         }
 
         if (NCE)

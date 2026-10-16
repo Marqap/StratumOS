@@ -160,6 +160,10 @@ NDIS_STATUS NwifiMsmGetBssList(
     _In_ ULONG OutLength,
     _Out_ PULONG BytesWritten);
 
+BOOLEAN NwifiMsmBssUsesSaeH2e(
+    _In_ PNWIFI_MSM Msm,
+    _In_reads_bytes_(IEEE80211_ADDR_LEN) const UCHAR *Bssid);
+
 /* Fill an NWIFI_LINK_STATE snapshot. */
 VOID NwifiMsmQueryState(
     _In_ PNWIFI_MSM Msm,
@@ -215,9 +219,14 @@ NDIS_STATUS NwifiSupplicantStart(_In_ PNWIFI_MSM Msm);
  * authentication (currently WPA3-SAE). */
 NDIS_STATUS NwifiSupplicantSeedFirmware(_In_ PNWIFI_MSM Msm);
 
+VOID NwifiSupplicantSaeIndication(_In_ PNWIFI_MSM Msm, _In_reads_bytes_(Length) const UCHAR *Message, _In_ ULONG Length);
+
+VOID NwifiSupplicantQueueSaeIndication(_In_ PNWIFI_MSM Msm, _In_reads_bytes_(Length) const VOID *Message, _In_ ULONG Length);
+
 /* Stop the supplicant session (zeroise keys, disarm) but keep the object so a
  * concurrent RX-path EAPOL feed never dereferences freed memory. */
 VOID NwifiSupplicantStop(_In_ PNWIFI_MSM Msm);
+VOID NwifiSupplicantResetSession(_In_ PNWIFI_MSM Msm);
 
 /* Free the supplicant object entirely.  Only call once the data path is
  * quiesced (NwifiMsmDestroy at unbind). */
@@ -230,9 +239,11 @@ NDIS_STATUS NwifiSupplicantSetPassphrase(
     _In_ ULONG Length);
 
 /* Tell the supplicant the authenticator (AP) MAC once association completes. */
-VOID NwifiSupplicantSetApAddr(
+VOID NwifiSupplicantSetAssociation(
     _In_ PNWIFI_MSM Msm,
-    _In_reads_bytes_(6) PUCHAR ApMac);
+    _In_reads_bytes_(6) PUCHAR ApMac,
+    _In_reads_bytes_opt_(RequestIeLength) PUCHAR RequestIes,
+    _In_ ULONG RequestIeLength);
 
 /* Feed an EAPOL-Key frame to the supplicant; transmits any reply and, on
  * COMPLETED, installs the derived PTK/GTK.  Returns TRUE if consumed. */

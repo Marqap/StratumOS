@@ -23,6 +23,13 @@ if(TARGET mesa_gallium)
     list(APPEND WOW64_I386_TARGETS mesa_gallium)
 endif()
 
+# dxilconv.dll is loaded by the Direct3D 12 runtime of 32-bit processes too.
+set(WOW64_I386_DXILCONV_FILE)
+if(TARGET dxilconv)
+    set(WOW64_I386_DXILCONV_FILE "${WOW64_I386_BINARY_DIR}/submodules/dxilconv/dxilconv.dll")
+    list(APPEND WOW64_I386_TARGETS dxilconv)
+endif()
+
 # Walk a target's link closure to find the DLL modules it imports. ReactOS
 # links DLL imports through "lib<module>" import libraries, so those names
 # are mapped back to the module targets that provide them.
@@ -131,6 +138,9 @@ foreach(_target IN LISTS WOW64_I386_MODULES WOW64_I386_EXECUTABLES)
     list(APPEND WOW64_I386_FILES "${_file}")
 endforeach()
 set(WOW64_I386_OPTIONAL_FILES)
+if(WOW64_I386_DXILCONV_FILE)
+    list(APPEND WOW64_I386_OPTIONAL_FILES "${WOW64_I386_DXILCONV_FILE}")
+endif()
 if(WOW64_I386_MESA_FILE)
     list(APPEND WOW64_I386_OPTIONAL_FILES "${WOW64_I386_MESA_FILE}")
     if(WOW64_I386_MESA_D3D_FILE)
@@ -191,6 +201,11 @@ set(_wow64_i386_cmake_args
     -DENABLE_ROSTESTS:BOOL=${ENABLE_ROSTESTS}
     -DENABLE_APPSMOKE_TESTS:BOOL=${ENABLE_APPSMOKE_TESTS})
 
+if(WOW64_I386_DXILCONV_FILE)
+    list(APPEND _wow64_i386_cmake_args -DENABLE_DXILCONV:BOOL=ON)
+else()
+    list(APPEND _wow64_i386_cmake_args -DENABLE_DXILCONV:BOOL=OFF)
+endif()
 if(WOW64_I386_MESA_FILE)
     list(APPEND _wow64_i386_cmake_args
         -DMESA_GALLIUM_FROM_SOURCE:BOOL=ON
@@ -269,15 +284,24 @@ endif()
 _wow64_get_target_file(comctl32 _wow64_comctl32_file)
 _wow64_get_target_file(comctl32_v6 _wow64_comctl32_v6_file)
 _wow64_get_target_file(gdiplus _wow64_gdiplus_file)
+_wow64_get_target_file(msvcm90 _wow64_msvcm90_file)
+_wow64_get_target_file(msvcp90 _wow64_msvcp90_file)
+_wow64_get_target_file(msvcr90 _wow64_msvcr90_file)
 add_cd_file(TARGET wow64_i386 FILE ${_wow64_comctl32_file} DESTINATION reactos/winsxs/x86_microsoft.windows.common-controls_6595b64144ccf1df_5.82.2600.2982_none_deadbeef FOR all)
 add_cd_file(TARGET wow64_i386 FILE ${_wow64_comctl32_v6_file} DESTINATION reactos/winsxs/x86_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef FOR all)
 add_cd_file(TARGET wow64_i386 FILE ${_wow64_gdiplus_file} DESTINATION reactos/winsxs/x86_microsoft.windows.gdiplus_6595b64144ccf1df_1.1.7601.23038_none_deadbeef FOR all)
 add_cd_file(TARGET wow64_i386 FILE ${_wow64_gdiplus_file} DESTINATION reactos/winsxs/x86_microsoft.windows.gdiplus_6595b64144ccf1df_1.0.14393.0_none_deadbeef FOR all)
+add_cd_file(TARGET wow64_i386 FILE ${_wow64_msvcr90_file} ${_wow64_msvcp90_file} ${_wow64_msvcm90_file} DESTINATION reactos/winsxs/x86_microsoft.vc90.crt_1fc8b3b9a1e18e3b_9.0.30729.6161_none_deadbeef FOR all)
+_wow64_get_target_file(fusion _wow64_fusion_file)
+_wow64_get_target_file(fusion_2_0 _wow64_fusion_2_0_file)
+add_cd_file(TARGET wow64_i386 FILE ${_wow64_fusion_file} DESTINATION reactos/Microsoft.NET/Framework/v4.0.30319 FOR all)
+add_cd_file(TARGET wow64_i386 FILE ${_wow64_fusion_2_0_file} DESTINATION reactos/Microsoft.NET/Framework/v2.0.50727 FOR all)
 add_cd_file(FILE
     ${REACTOS_SOURCE_DIR}/dll/win32/comctl32/x86_microsoft.windows.common-controls_6595b64144ccf1df_5.82.2600.2982_none_deadbeef.manifest
     ${REACTOS_SOURCE_DIR}/dll/win32/comctl32/x86_microsoft.windows.common-controls_6595b64144ccf1df_6.0.2600.2982_none_deadbeef.manifest
     ${REACTOS_SOURCE_DIR}/dll/win32/gdiplus/x86_microsoft.windows.gdiplus_6595b64144ccf1df_1.1.7601.23038_none_deadbeef.manifest
     ${REACTOS_SOURCE_DIR}/dll/win32/gdiplus/x86_microsoft.windows.gdiplus_6595b64144ccf1df_1.0.14393.0_none_deadbeef.manifest
+    ${REACTOS_SOURCE_DIR}/dll/win32/msvcr90/x86_microsoft.vc90.crt_1fc8b3b9a1e18e3b_9.0.30729.6161_none_deadbeef.manifest
     DESTINATION reactos/winsxs/manifests FOR all)
 
 if(WOW64_I386_ALIAS_FILES)

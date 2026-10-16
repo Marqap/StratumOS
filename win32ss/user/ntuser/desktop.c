@@ -51,11 +51,7 @@ DWORD gdwWinlogonSectionSize = 128;
 /* Currently active desktop */
 PDESKTOP gpdeskInputDesktop = NULL;
 HDC ScreenDeviceContext = NULL;
-PTHREADINFO gptiDesktopThread = NULL;
 HCURSOR gDesktopCursor = NULL;
-PKEVENT gpDesktopThreadStartedEvent = NULL;
-PKEVENT gpDesktopSwitchEvent = NULL;    ///< WinSta0_DesktopSwitch legacy (NT 3.5+) event.
-HANDLE ghDesktopSwitchEvent = NULL;     ///< WinSta0_DesktopSwitch handle in the CSRSS process.
 
 /* OBJECT CALLBACKS **********************************************************/
 
@@ -285,21 +281,6 @@ InitDesktopImpl(VOID)
     ExDesktopObjectType->TypeInfo.DefaultNonPagedPoolCharge = sizeof(DESKTOP);
     ExDesktopObjectType->TypeInfo.GenericMapping = IntDesktopMapping;
     ExDesktopObjectType->TypeInfo.ValidAccessMask = DESKTOP_ALL_ACCESS;
-
-    /* Allocate memory for the event structure */
-    gpDesktopThreadStartedEvent = ExAllocatePoolWithTag(NonPagedPool,
-                                                        sizeof(KEVENT),
-                                                        USERTAG_EVENT);
-    if (!gpDesktopThreadStartedEvent)
-    {
-        ERR("Failed to allocate event!\n");
-        return STATUS_NO_MEMORY;
-    }
-
-    /* Initialize the kernel event */
-    KeInitializeEvent(gpDesktopThreadStartedEvent,
-                      SynchronizationEvent,
-                      FALSE);
 
     return STATUS_SUCCESS;
 }
@@ -852,7 +833,7 @@ IntResolveDesktop(
 
     /* Window station name */
     MemSize = _scwprintf(L"Service-0x%x-%x$", MAXULONG, MAXULONG) * sizeof(WCHAR);
-    MemSize = gustrWindowStationsDir.Length + sizeof(OBJ_NAME_PATH_SEPARATOR)
+    MemSize = UserGetWinStaDirName(Process)->Length + sizeof(OBJ_NAME_PATH_SEPARATOR)
               + max(WinStaName.Length, MemSize) + sizeof(UNICODE_NULL);
     if (MemSize > MAXUSHORT)
     {
@@ -969,7 +950,7 @@ IntResolveDesktop(
     Status = RtlStringCbPrintfW(ObjectName->Buffer,
                                 ObjectName->MaximumLength,
                                 L"%wZ\\%wZ",
-                                &gustrWindowStationsDir,
+                                UserGetWinStaDirName(Process),
                                 &WinStaName);
     if (!NT_SUCCESS(Status))
     {
@@ -1020,7 +1001,7 @@ IntResolveDesktop(
             LUID SystemLuid = SYSTEM_LUID;
 
             /* Interactive window station: check for user LUID */
-            WinStaObject = InputWindowStation;
+            WinStaObject = UserGetInputWindowStation(Process);
 
             Status = STATUS_ACCESS_DENIED;
 
@@ -1083,7 +1064,7 @@ IntResolveDesktop(
             Status = RtlStringCbPrintfW(ObjectName->Buffer,
                                         ObjectName->MaximumLength,
                                         L"%wZ\\Service-0x%x-%x$",
-                                        &gustrWindowStationsDir,
+                                        UserGetWinStaDirName(Process),
                                         ProcessLuid.HighPart,
                                         ProcessLuid.LowPart);
             if (!NT_SUCCESS(Status))
@@ -1361,7 +1342,7 @@ IntGetDesktopObjectHandle(PDESKTOP DesktopObject)
                                        NULL,
                                        0,
                                        ExDesktopObjectType,
-                                       UserMode,
+                                       KernelMode,
                                        (PHANDLE)&hDesk);
         if (!NT_SUCCESS(Status))
         {
@@ -1425,7 +1406,7 @@ IntSetFocusMessageQueue(PUSER_MESSAGE_QUEUE NewQueue)
     else
     {
         gpqForeground = NULL;
-        ERR("ptiLastInput is CLEARED!!\n");
+        TRACE("ptiLastInput is CLEARED!!\n");
         ptiLastInput = NULL; // ReactOS hacks... should check for process death.
     }
 }
@@ -1606,8 +1587,9 @@ VOID NTAPI DesktopThreadMain(VOID)
 {
     BOOL Ret;
     MSG Msg;
+    PUSER_SESSION Session = UserGetCurrentSession();
 
-    gptiDesktopThread = PsGetCurrentThreadWin32Thread();
+    Session->DesktopThread = PsGetCurrentThreadWin32Thread();
 
     UserEnterExclusive();
 
@@ -1615,7 +1597,7 @@ VOID NTAPI DesktopThreadMain(VOID)
        classes will be allocated from the shared heap */
     UserRegisterSystemClasses();
 
-    KeSetEvent(gpDesktopThreadStartedEvent, IO_NO_INCREMENT, FALSE);
+    KeSetEvent(&Session->DesktopThreadStarted, IO_NO_INCREMENT, FALSE);
 
     while (TRUE)
     {
@@ -2594,7 +2576,7 @@ UserInitializeDesktop(PDESKTOP pdesk, PUNICODE_STRING DesktopName, PWINSTATION_O
     TRACE("UserInitializeDesktop desktop 0x%p with name %wZ\n", pdesk, DesktopName);
 
     /* Set desktop size, based on whether the WinSta is interactive or not */
-    if (pwinsta == InputWindowStation)
+    if (pwinsta == UserGetInputWindowStation(PsGetCurrentProcess()))
     {
         /* Check if the Desktop is named "Winlogon" */
         if (RtlEqualUnicodeString(DesktopName, &WinlogonDesktop, TRUE))
@@ -2722,7 +2704,7 @@ IntCreateDesktop(
 
     ptiCurrent = PsGetCurrentThreadWin32Thread();
     ASSERT(ptiCurrent);
-    ASSERT(gptiDesktopThread);
+    ASSERT(UserGetDesktopThread());
 
     /* Turn off hooks when calling any CreateWindowEx from inside win32k */
     NoHooks = (ptiCurrent->TIF_flags & TIF_DISABLEHOOKS);
@@ -3003,7 +2985,7 @@ HDESK UserOpenInputDesktop(DWORD dwFlags,
         return NULL;
     }
 
-    if (pti->ppi->prpwinsta != InputWindowStation)
+    if (pti->ppi->prpwinsta != UserGetDisplayInputWindowStation())
     {
         ERR("Tried to open input desktop from non interactive winsta!\n");
         EngSetLastError(ERROR_INVALID_FUNCTION);
@@ -3218,7 +3200,7 @@ NtUserResolveDesktop(
     UNICODE_STRING CapturedDesktopPath;
 
     /* Allow only the Console Server to perform this operation (via CSRSS) */
-    if (PsGetCurrentProcess() != gpepCSRSS)
+    if (!UserIsCsrProcess(PsGetCurrentProcess()))
         return NULL;
 
     /* Get the process object the user handle was referencing */
@@ -3356,14 +3338,14 @@ NtUserSwitchDesktop(HDESK hdesk)
      * is the logon application itself
      */
     if ((pdesk->rpwinstaParent->Flags & WSS_LOCKED) &&
-        gpidLogon != PsGetCurrentProcessId())
+        !UserIsLogonProcess(PsGetCurrentProcessId()))
     {
         ObDereferenceObject(pdesk);
         ERR("Switching desktop 0x%p denied because the window station is locked!\n", hdesk);
         goto Exit; // Return FALSE
     }
 
-    if (pdesk->rpwinstaParent != InputWindowStation)
+    if (pdesk->rpwinstaParent != UserGetDisplayInputWindowStation())
     {
         ObDereferenceObject(pdesk);
         ERR("Switching desktop 0x%p denied because desktop doesn't belong to the interactive winsta!\n", hdesk);
@@ -3389,7 +3371,7 @@ NtUserSwitchDesktop(HDESK hdesk)
     }
 
     /* Set the active desktop in the desktop's window station. */
-    InputWindowStation->ActiveDesktop = pdesk;
+    pdesk->rpwinstaParent->ActiveDesktop = pdesk;
 
     /* Set the global state. */
     gpdeskInputDesktop = pdesk;
@@ -3403,7 +3385,7 @@ NtUserSwitchDesktop(HDESK hdesk)
     /* Notify waiters that a desktop has been switched on the
      * interactive window station: pulse the legacy (NT 3.5+)
      * event and send the desktop-switch notification (Vista+) */
-    KePulseEvent(gpDesktopSwitchEvent, EVENT_INCREMENT, FALSE);
+    KePulseEvent(gpDisplaySession->DesktopSwitchEvent, EVENT_INCREMENT, FALSE);
 #if (_WIN32_WINNT >= _WIN32_WINNT_VISTA)
     IntNotifyWinEvent(EVENT_SYSTEM_DESKTOPSWITCH, NULL, OBJID_WINDOW, CHILDID_SELF, 0);
 #endif
@@ -3461,8 +3443,10 @@ NtUserGetThreadDesktop(DWORD dwThreadId, HDESK hConsoleDesktop)
          * console desktop handle as a fallback. Otherwise this means that the
          * thread is either not Win32 or invalid.
          */
+        PUSER_SESSION Session = UserGetCurrentSession();
+
         hDesk = hConsoleDesktop;
-        Process = gpepCSRSS;
+        Process = Session ? Session->CsrProcess : NULL;
     }
     else
     {
@@ -3856,7 +3840,7 @@ NtUserSetThreadDesktop(HDESK hDesktop)
     // FIXME: IntSetThreadDesktop validates the desktop handle, it should happen
     // here too and set the NT error level. Q. Is it necessary to have the validation
     // in IntSetThreadDesktop? Is it needed there too?
-    if (hDesktop || (!hDesktop && PsGetCurrentProcess() == gpepCSRSS))
+    if (hDesktop || (!hDesktop && UserIsCsrProcess(PsGetCurrentProcess())))
         ret = IntSetThreadDesktop(hDesktop, FALSE);
 
     UserLeave();

@@ -24,7 +24,13 @@ DWORD DebugTraceLevel = MIN_TRACE;
 
 /* FIXME: should depend on SystemSize */
 ULONG AfdReceiveWindowSize = 0x40000;
-ULONG AfdSendWindowSize = 0x2000;
+ULONG AfdReportedReceiveWindowSize = 0x10000;
+ULONG AfdSendWindowSize = 0x10000;
+
+static LIST_ENTRY AfdAddressListChangeSockets;
+static FAST_MUTEX AfdAddressListChangeLock;
+static UNICODE_STRING AfdTdiClientName = RTL_CONSTANT_STRING(L"AFD");
+static HANDLE AfdTdiBindingHandle;
 
 void OskitDumpBuffer( PCHAR Data, UINT Len ) {
     unsigned int i;
@@ -371,6 +377,7 @@ AfdCreateSocket(PDEVICE_OBJECT DeviceObject, PIRP Irp,
     FCB->AddressFile.Handle = INVALID_HANDLE_VALUE;
     FCB->Connection.Handle = INVALID_HANDLE_VALUE;
     FCB->Recv.Size = AfdReceiveWindowSize;
+    FCB->ReportedReceiveWindowSize = AfdReportedReceiveWindowSize;
     FCB->Send.Size = AfdSendWindowSize;
 
     KeInitializeMutex( &FCB->Mutex, 0 );
@@ -381,6 +388,7 @@ AfdCreateSocket(PDEVICE_OBJECT DeviceObject, PIRP Irp,
 
     InitializeListHead( &FCB->DatagramList );
     InitializeListHead( &FCB->PendingConnections );
+    InitializeListHead( &FCB->AddressListChangeEntry );
 
     AFD_DbgPrint(MID_TRACE,("%p: Checking command channel\n", FCB));
 
@@ -462,6 +470,25 @@ AfdCleanupSocket(PDEVICE_OBJECT DeviceObject, PIRP Irp,
 
     if( !SocketAcquireStateLock( FCB ) ) return LostSocket(Irp);
 
+    FCB->CleanedUp = TRUE;
+
+    if (!(FCB->Flags & AFD_ENDPOINT_CONNECTIONLESS) &&
+        FCB->SharedData.State == SOCKET_STATE_CONNECTED)
+    {
+        while (!IsListEmpty(&FCB->PendingIrpList[FUNCTION_RECV]))
+        {
+            CurrentEntry = RemoveHeadList(&FCB->PendingIrpList[FUNCTION_RECV]);
+            CurrentIrp = CONTAINING_RECORD(CurrentEntry, IRP, Tail.Overlay.ListEntry);
+            CleanupPendingIrp(FCB, CurrentIrp, IoGetCurrentIrpStackLocation(CurrentIrp), NULL);
+            CurrentIrp->IoStatus.Status = STATUS_CONNECTION_ABORTED;
+            CurrentIrp->IoStatus.Information = 0;
+            if (CurrentIrp->MdlAddress)
+                UnlockRequest(CurrentIrp, IoGetCurrentIrpStackLocation(CurrentIrp));
+            (void)IoSetCancelRoutine(CurrentIrp, NULL);
+            IoCompleteRequest(CurrentIrp, IO_NETWORK_INCREMENT);
+        }
+    }
+
     for (Function = 0; Function < MAX_FUNCTIONS; Function++)
     {
         CurrentEntry = FCB->PendingIrpList[Function].Flink;
@@ -498,6 +525,14 @@ AfdCloseSocket(PDEVICE_OBJECT DeviceObject, PIRP Irp,
 
     AFD_DbgPrint(MID_TRACE,("AfdClose(DeviceObject %p Irp %p)\n",
                             DeviceObject, Irp));
+
+    if (FCB)
+    {
+        ExAcquireFastMutex(&AfdAddressListChangeLock);
+        if (!IsListEmpty(&FCB->AddressListChangeEntry))
+            RemoveEntryList(&FCB->AddressListChangeEntry);
+        ExReleaseFastMutex(&AfdAddressListChangeLock);
+    }
 
     if( !SocketAcquireStateLock( FCB ) ) return STATUS_FILE_CLOSED;
 
@@ -567,6 +602,12 @@ AfdCloseSocket(PDEVICE_OBJECT DeviceObject, PIRP Irp,
 
     if (FCB->AddressFrom)
         ExFreePoolWithTag(FCB->AddressFrom, TAG_AFD_TDI_CONNECTION_INFORMATION);
+
+    if (FCB->RecvControl)
+        ExFreePoolWithTag(FCB->RecvControl, TAG_AFD_DATA_BUFFER);
+
+    if (FCB->SendDatagramBuffer)
+        ExFreePoolWithTag(FCB->SendDatagramBuffer, TAG_AFD_DATA_BUFFER);
 
     if (FCB->ConnectCallInfo)
         ExFreePoolWithTag(FCB->ConnectCallInfo, TAG_AFD_TDI_CONNECTION_INFORMATION);
@@ -786,6 +827,8 @@ AfdDisconnect(PDEVICE_OBJECT DeviceObject, PIRP Irp,
     /* Receive direction or both */
     else
     {
+        BOOLEAN UnreadData = (FCB->Recv.Content > FCB->Recv.BytesUsed);
+
         /* Mark that we can't issue another receive request */
         FCB->TdiReceiveClosed = TRUE;
 
@@ -809,6 +852,10 @@ AfdDisconnect(PDEVICE_OBJECT DeviceObject, PIRP Irp,
         {
             /* No need to tell the transport driver for receive direction only */
             return UnlockAndMaybeComplete( FCB, STATUS_SUCCESS, Irp, 0 );
+        }
+        else if (!(DisReq->DisconnectType & AFD_DISCONNECT_ABORT) && !UnreadData)
+        {
+            Flags = TDI_DISCONNECT_RELEASE;
         }
         else
         {
@@ -942,6 +989,102 @@ AfdQueryVolumeInformation(PDEVICE_OBJECT DeviceObject, PIRP Irp, PIO_STACK_LOCAT
     IoCompleteRequest(Irp, IO_NETWORK_INCREMENT);
 
     return Status;
+}
+
+static NTSTATUS NTAPI
+AfdAddressListChange(PDEVICE_OBJECT DeviceObject, PIRP Irp,
+                     PIO_STACK_LOCATION IrpSp)
+{
+    PFILE_OBJECT FileObject = IrpSp->FileObject;
+    PAFD_FCB FCB = FileObject->FsContext;
+    ULONG AfdFlags = 0;
+    NTSTATUS Status;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    if (IrpSp->Parameters.DeviceIoControl.InputBufferLength >= sizeof(ULONG))
+        AfdFlags = *(PULONG)Irp->AssociatedIrp.SystemBuffer;
+
+    ExAcquireFastMutex(&AfdAddressListChangeLock);
+
+    if (!SocketAcquireStateLock(FCB))
+    {
+        ExReleaseFastMutex(&AfdAddressListChangeLock);
+        return LostSocket(Irp);
+    }
+
+    if (IsListEmpty(&FCB->AddressListChangeEntry))
+        InsertTailList(&AfdAddressListChangeSockets, &FCB->AddressListChangeEntry);
+
+    FCB->PollState &= ~AFD_EVENT_ADDRESS_LIST_CHANGE;
+    FCB->EventSelectDisabled &= ~AFD_EVENT_ADDRESS_LIST_CHANGE;
+
+    if (AfdFlags & AFD_IMMEDIATE)
+        Status = UnlockAndMaybeComplete(FCB, STATUS_CANT_WAIT, Irp, 0);
+    else
+        Status = LeaveIrpUntilLater(FCB, Irp, FUNCTION_ADDRESS_LIST_CHANGE);
+
+    ExReleaseFastMutex(&AfdAddressListChangeLock);
+
+    return Status;
+}
+
+static VOID
+AfdNotifyAddressListChange(USHORT AddressType)
+{
+    PLIST_ENTRY Entry, NextEntry;
+    PAFD_FCB FCB;
+    PIRP Irp;
+
+    ExAcquireFastMutex(&AfdAddressListChangeLock);
+
+    for (Entry = AfdAddressListChangeSockets.Flink;
+         Entry != &AfdAddressListChangeSockets;
+         Entry = NextEntry)
+    {
+        NextEntry = Entry->Flink;
+        FCB = CONTAINING_RECORD(Entry, AFD_FCB, AddressListChangeEntry);
+
+        if (!SocketAcquireStateLock(FCB))
+            continue;
+
+        if (FCB->LocalAddress && FCB->LocalAddress->TAAddressCount &&
+            FCB->LocalAddress->Address[0].AddressType != AddressType)
+        {
+            SocketStateUnlock(FCB);
+            continue;
+        }
+
+        RemoveEntryList(Entry);
+        InitializeListHead(Entry);
+
+        while (!IsListEmpty(&FCB->PendingIrpList[FUNCTION_ADDRESS_LIST_CHANGE]))
+        {
+            Irp = CONTAINING_RECORD(RemoveHeadList(&FCB->PendingIrpList[FUNCTION_ADDRESS_LIST_CHANGE]),
+                                    IRP, Tail.Overlay.ListEntry);
+            Irp->IoStatus.Status = STATUS_SUCCESS;
+            Irp->IoStatus.Information = 0;
+            (void)IoSetCancelRoutine(Irp, NULL);
+            IoCompleteRequest(Irp, IO_NETWORK_INCREMENT);
+        }
+
+        FCB->PollState |= AFD_EVENT_ADDRESS_LIST_CHANGE;
+        FCB->PollStatus[FD_ADDRESS_LIST_CHANGE_BIT] = STATUS_SUCCESS;
+        PollReeval(FCB->DeviceExt, FCB->FileObject);
+
+        SocketStateUnlock(FCB);
+    }
+
+    ExReleaseFastMutex(&AfdAddressListChangeLock);
+}
+
+static VOID NTAPI
+AfdTdiAddressChange(PTA_ADDRESS Address, PUNICODE_STRING DeviceName, PTDI_PNP_CONTEXT Context)
+{
+    UNREFERENCED_PARAMETER(DeviceName);
+    UNREFERENCED_PARAMETER(Context);
+
+    AfdNotifyAddressListChange(Address->AddressType);
 }
 
 static DRIVER_DISPATCH AfdDispatch;
@@ -1100,8 +1243,10 @@ AfdDispatch(PDEVICE_OBJECT DeviceObject, PIRP Irp)
             return AfdGetTdiHandles(DeviceObject, Irp, IrpSp);
 
         case IOCTL_AFD_DEFER_ACCEPT:
-            DbgPrint("IOCTL_AFD_DEFER_ACCEPT is UNIMPLEMENTED!\n");
-            break;
+            return AfdDeferAccept(DeviceObject, Irp, IrpSp);
+
+        case IOCTL_AFD_ADDRESS_LIST_CHANGE:
+            return AfdAddressListChange(DeviceObject, Irp, IrpSp);
 
         case IOCTL_AFD_GET_PENDING_CONNECT_DATA:
             DbgPrint("IOCTL_AFD_GET_PENDING_CONNECT_DATA is UNIMPLEMENTED!\n");
@@ -1207,12 +1352,14 @@ CleanupPendingIrp(PAFD_FCB FCB, PIRP Irp, PIO_STACK_LOCATION IrpSp, PAFD_ACTIVE_
     {
         ASSERT(IrpSp->MajorFunction == IRP_MJ_DEVICE_CONTROL);
 
-        if (IrpSp->Parameters.DeviceIoControl.IoControlCode == IOCTL_AFD_RECV)
+        if (IrpSp->Parameters.DeviceIoControl.IoControlCode == IOCTL_AFD_RECV ||
+            IrpSp->Parameters.DeviceIoControl.IoControlCode == IOCTL_AFD_RECV_DATAGRAM)
         {
             RecvReq = GetLockedData(Irp, IrpSp);
             UnlockBuffers(RecvReq->BufferArray, RecvReq->BufferCount, CheckUnlockExtraBuffers(FCB, IrpSp));
         }
-        else if (IrpSp->Parameters.DeviceIoControl.IoControlCode == IOCTL_AFD_SEND)
+        else if (IrpSp->Parameters.DeviceIoControl.IoControlCode == IOCTL_AFD_SEND ||
+                 IrpSp->Parameters.DeviceIoControl.IoControlCode == IOCTL_AFD_SEND_DATAGRAM)
         {
             SendReq = GetLockedData(Irp, IrpSp);
             UnlockBuffers(SendReq->BufferArray, SendReq->BufferCount, CheckUnlockExtraBuffers(FCB, IrpSp));
@@ -1338,11 +1485,29 @@ AfdCancelHandler(PDEVICE_OBJECT DeviceObject,
             Function = FUNCTION_DISCONNECT;
             break;
 
+        case IOCTL_AFD_ADDRESS_LIST_CHANGE:
+            Function = FUNCTION_ADDRESS_LIST_CHANGE;
+            break;
+
         default:
             ASSERT(FALSE);
             UnlockAndMaybeComplete(FCB, STATUS_CANCELLED, Irp, 0);
             ObDereferenceObject(FileObject);
             return;
+    }
+
+    if (Function == FUNCTION_RECV)
+    {
+        CurrentEntry = FCB->PendingIrpList[FUNCTION_RECV_OOB].Flink;
+        while (CurrentEntry != &FCB->PendingIrpList[FUNCTION_RECV_OOB])
+        {
+            if (CONTAINING_RECORD(CurrentEntry, IRP, Tail.Overlay.ListEntry) == Irp)
+            {
+                Function = FUNCTION_RECV_OOB;
+                break;
+            }
+            CurrentEntry = CurrentEntry->Flink;
+        }
     }
 
     CurrentEntry = FCB->PendingIrpList[Function].Flink;
@@ -1373,6 +1538,9 @@ static VOID NTAPI
 AfdUnload(PDRIVER_OBJECT DriverObject)
 {
     UNREFERENCED_PARAMETER(DriverObject);
+
+    if (AfdTdiBindingHandle)
+        TdiDeregisterPnPHandlers(AfdTdiBindingHandle);
 }
 
 NTSTATUS NTAPI
@@ -1381,6 +1549,7 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     PDEVICE_OBJECT DeviceObject;
     UNICODE_STRING wstrDeviceName = RTL_CONSTANT_STRING(L"\\Device\\Afd");
     PAFD_DEVICE_EXTENSION DeviceExt;
+    TDI_CLIENT_INTERFACE_INFO TdiClientInfo;
     NTSTATUS Status;
 
     UNREFERENCED_PARAMETER(RegistryPath);
@@ -1411,6 +1580,17 @@ DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     DeviceExt = DeviceObject->DeviceExtension;
     KeInitializeSpinLock( &DeviceExt->Lock );
     InitializeListHead( &DeviceExt->Polls );
+
+    InitializeListHead(&AfdAddressListChangeSockets);
+    ExInitializeFastMutex(&AfdAddressListChangeLock);
+
+    RtlZeroMemory(&TdiClientInfo, sizeof(TdiClientInfo));
+    TdiClientInfo.TdiVersion = TDI_CURRENT_VERSION;
+    TdiClientInfo.ClientName = &AfdTdiClientName;
+    TdiClientInfo.AddAddressHandlerV2 = AfdTdiAddressChange;
+    TdiClientInfo.DelAddressHandlerV2 = AfdTdiAddressChange;
+    if (!NT_SUCCESS(TdiRegisterPnPHandlers(&TdiClientInfo, sizeof(TdiClientInfo), &AfdTdiBindingHandle)))
+        AfdTdiBindingHandle = NULL;
 
     AFD_DbgPrint(MID_TRACE,("Device created: object %p ext %p\n",
                             DeviceObject, DeviceExt));

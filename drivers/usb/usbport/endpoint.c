@@ -747,7 +747,8 @@ USBPORT_DeleteEndpoint(IN PDEVICE_OBJECT FdoDevice,
 
     KeAcquireSpinLock(&FdoExtension->EndpointListSpinLock, &OldIrql);
     if ((Endpoint->WorkerLink.Flink && Endpoint->WorkerLink.Blink) ||
-        Endpoint->LockCounter != -1)
+        Endpoint->LockCounter != -1 ||
+        Endpoint->TimeoutPin != 0)
     {
         ExInterlockedInsertTailList(&FdoExtension->EndpointClosedList,
                                     &Endpoint->CloseLink,
@@ -2148,15 +2149,18 @@ USBPORT_DmaEndpointActive(IN PDEVICE_OBJECT FdoDevice,
     PLIST_ENTRY Entry;
     PUSBPORT_TRANSFER Transfer;
     MPSTATUS MpStatus;
-    BOOLEAN IsochronousInFlight = FALSE;
-    BOOLEAN QueueIsochronous;
+    BOOLEAN InFlight = FALSE;
+    BOOLEAN Pipelined;
     KIRQL OldIrql;
 
     DPRINT_CORE("USBPORT_DmaEndpointActive \n");
 
     FdoExtension = FdoDevice->DeviceExtension;
-    QueueIsochronous =
-        Endpoint->EndpointProperties.TransferType == USBPORT_TRANSFER_TYPE_ISOCHRONOUS;
+    Pipelined =
+        Endpoint->EndpointProperties.TransferType == USBPORT_TRANSFER_TYPE_ISOCHRONOUS ||
+        ((FdoExtension->MiniPortInterface->Packet.MiniPortFlags & USB_MINIPORT_FLAGS_USB3) &&
+         (Endpoint->EndpointProperties.TransferType == USBPORT_TRANSFER_TYPE_BULK ||
+          Endpoint->EndpointProperties.TransferType == USBPORT_TRANSFER_TYPE_INTERRUPT));
 
     Entry = Endpoint->TransferList.Flink;
 
@@ -2181,10 +2185,10 @@ USBPORT_DmaEndpointActive(IN PDEVICE_OBJECT FdoDevice,
 
         if (Transfer->Flags & TRANSFER_FLAG_SUBMITED)
         {
-            if (!QueueIsochronous)
+            if (!Pipelined)
                 return USBPORT_ENDPOINT_ACTIVE;
 
-            IsochronousInFlight = TRUE;
+            InFlight = TRUE;
             Entry = Transfer->TransferLink.Flink;
             continue;
         }
@@ -2246,7 +2250,7 @@ USBPORT_DmaEndpointActive(IN PDEVICE_OBJECT FdoDevice,
             {
                 USBD_STATUS USBDStatus;
 
-                if (QueueIsochronous && IsochronousInFlight &&
+                if (Pipelined && InFlight &&
                     MpStatus == MP_STATUS_NO_RESOURCES)
                 {
                     /* A completed earlier TD will invalidate this endpoint
@@ -2269,10 +2273,10 @@ USBPORT_DmaEndpointActive(IN PDEVICE_OBJECT FdoDevice,
             }
 
             Transfer->Flags |= TRANSFER_FLAG_SUBMITED;
-            if (QueueIsochronous)
-                IsochronousInFlight = TRUE;
+            if (Pipelined)
+                InFlight = TRUE;
 
-            if (!QueueIsochronous)
+            if (!Pipelined)
                 return USBPORT_ENDPOINT_ACTIVE;
         }
 

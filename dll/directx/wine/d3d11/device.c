@@ -5021,7 +5021,11 @@ static HRESULT STDMETHODCALLTYPE d3d11_device_CheckFeatureSupport(ID3D11Device5 
             options->TiledResourcesTier = D3D11_TILED_RESOURCES_NOT_SUPPORTED;
             options->MinMaxFiltering = wined3d_caps.min_max_filtering;
             options->ClearViewAlsoSupportsDepthOnlyFormats = FALSE;
+#ifdef __REACTOS__
+            options->MapOnDefaultBuffers = device->state->feature_level >= D3D_FEATURE_LEVEL_11_0;
+#else
             options->MapOnDefaultBuffers = FALSE;
+#endif
             return S_OK;
         }
 
@@ -5656,6 +5660,14 @@ static HRESULT STDMETHODCALLTYPE d3d_device_inner_QueryInterface(IUnknown *iface
     {
         *out = &device->ID3D11VideoDevice1_iface;
     }
+#ifdef __REACTOS__
+    else if (device->on12 && (IsEqualGUID(riid, &IID_ID3D11On12Device2)
+            || IsEqualGUID(riid, &IID_ID3D11On12Device1)
+            || IsEqualGUID(riid, &IID_ID3D11On12Device)))
+    {
+        *out = device->on12;
+    }
+#endif
     else
     {
         WARN("%s not implemented, returning E_NOINTERFACE.\n", debugstr_guid(riid));
@@ -5703,10 +5715,29 @@ static ULONG STDMETHODCALLTYPE d3d_device_inner_Release(IUnknown *iface)
         wine_rb_destroy(&device->rasterizer_states, NULL, NULL);
         wine_rb_destroy(&device->depthstencil_states, NULL, NULL);
         wine_rb_destroy(&device->blend_states, NULL, NULL);
+#ifdef __REACTOS__
+        if (device->on12)
+            d3d11_on12_destroy(device->on12);
+#endif
     }
 
     return refcount;
 }
+
+#ifdef __REACTOS__
+HRESULT d3d11_device_attach_on12(ID3D11Device *iface, IUnknown *on12)
+{
+    struct d3d_device *device;
+
+    if (!iface || iface->lpVtbl != (const ID3D11DeviceVtbl *)&d3d11_device_vtbl)
+        return E_NOINTERFACE;
+    device = impl_from_ID3D11Device(iface);
+    if (device->on12)
+        return E_FAIL;
+    device->on12 = on12;
+    return S_OK;
+}
+#endif
 
 /* IUnknown methods */
 
