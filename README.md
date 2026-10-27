@@ -1,3 +1,5 @@
+> [!IMPORTANT]
+> Because of syncing the repository to downstream ruining my hard work, I had to discontinue StratumOS.
 <p align="center">
   <img src="media/graphics/branding/libernt-banner.png" width="480" alt="LiberNT">
 </p>
